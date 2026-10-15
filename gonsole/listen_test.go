@@ -113,21 +113,39 @@ func serveListening(t *testing.T, l gonsole.Listening, handler http.Handler, tim
 	return listeningRun{}
 }
 
+// start is one ServeListening call a test makes, with the server, the timeouts beside it and the listener.
+type start struct {
+	srv      *http.Server
+	timeouts gonsole.Timeouts
+	at       gonsole.Listening
+}
+
+// startOf returns the start of a server over the report names built from timeouts, on l.
+func startOf(l gonsole.Listening, timeouts gonsole.Timeouts) start {
+	return start{srv: gonsole.NewServer("", reportNames(), timeouts), timeouts: timeouts, at: l}
+}
+
 // startRefused fails t unless ServeListening on l under timeouts answers want, with nothing bound or stopped.
 func startRefused(t *testing.T, l gonsole.Listening, timeouts gonsole.Timeouts, want string) {
 	t.Helper()
+	refusedOn(t, startOf(l, timeouts), want)
+}
+
+// refusedOn fails t unless the start s answers want, with nothing bound or stopped.
+func refusedOn(t *testing.T, s start, want string) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	var s stopper
+	var stopped stopper
 	j := newJournal()
 
-	err := gonsole.ServeListening(ctx, gonsole.NewServer("", reportNames(), timeouts), timeouts, l, s.stop, j.logger())
+	err := gonsole.ServeListening(ctx, s.srv, s.timeouts, s.at, stopped.stop, j.logger())
 
 	if errorText(err) != want {
 		t.Errorf("ServeListening() = %q, want %q", errorText(err), want)
 	}
-	if j.said("msg=listening") || s.calls != 0 {
-		t.Errorf("listened %t, stop calls %d, want nothing bound or stopped", j.said("msg=listening"), s.calls)
+	if j.said("msg=listening") || stopped.calls != 0 {
+		t.Errorf("listened %t, stop calls %d, want nothing bound or stopped", j.said("msg=listening"), stopped.calls)
 	}
 }
 
@@ -164,21 +182,21 @@ func TestServeListeningAnswersWhereItIsTold(t *testing.T) {
 	}
 }
 
-// idleUnbounded is the refusal of an idle exit while a connection can wait forever.
-const idleUnbounded = "gonsole: Listening.IdleExit needs Timeouts.Idle and Timeouts.ReadHeader above zero, " +
-	"or Timeouts.Read above zero to stand in for one at zero"
+// idleUnbounded is the refusal of an idle exit while a connection to the server can wait forever.
+const idleUnbounded = "gonsole: Listening.IdleExit needs the server's ReadTimeout above zero, " +
+	"and its IdleTimeout and ReadHeaderTimeout not negative"
 
 func TestServeListeningRefusesBeforeItListens(t *testing.T) {
 	t.Parallel()
 
 	noGrace := defaults
 	noGrace.Grace = 0
-	unbounded := defaults
-	unbounded.Idle, unbounded.Read = 0, 0
+	noRead := defaults
+	noRead.Read = 0
+	negativeRead := defaults
+	negativeRead.Read = -time.Second
 	negativeIdle := defaults
 	negativeIdle.Idle = -time.Second
-	unboundedHeader := defaults
-	unboundedHeader.ReadHeader, unboundedHeader.Read = 0, 0
 	negativeHeader := defaults
 	negativeHeader.ReadHeader = -time.Second
 	idleExit := gonsole.Listening{Address: "127.0.0.1:0", IdleExit: time.Minute}
@@ -194,9 +212,9 @@ func TestServeListeningRefusesBeforeItListens(t *testing.T) {
 		{"an empty address", defaults, gonsole.Listening{}, "gonsole: Listening.Address must not be empty"},
 		{"a negative idle exit", defaults, gonsole.Listening{Address: "127.0.0.1:0", IdleExit: -time.Second},
 			"gonsole: Listening.IdleExit must not be negative, got -1s"},
-		{"an idle exit no timeout bounds", unbounded, idleExit, idleUnbounded},
+		{"an idle exit with no read timeout", noRead, idleExit, idleUnbounded},
+		{"an idle exit beside a negative read timeout", negativeRead, idleExit, idleUnbounded},
 		{"an idle exit beside a negative idle timeout", negativeIdle, idleExit, idleUnbounded},
-		{"an idle exit with no header timeout", unboundedHeader, idleExit, idleUnbounded},
 		{"an idle exit beside a negative header timeout", negativeHeader, idleExit, idleUnbounded},
 		{"a zero grace beside a udp network", noGrace, udp, "gonsole: Timeouts.Grace must stand above zero, got 0s\n" +
 			`gonsole: Listening.Network must be unix, tcp or empty, got "udp"`},
@@ -486,22 +504,27 @@ func (j *journal) lineOf(text string) int {
 // endsIdle fails t unless ServeListening on l under timeouts ends unprompted with nil, logging the idle exit first.
 func endsIdle(t *testing.T, l gonsole.Listening, timeouts gonsole.Timeouts) {
 	t.Helper()
-	j := newJournal()
-	var s stopper
-	srv := gonsole.NewServer("", reportNames(), timeouts)
-	done := make(chan error, 1)
-	go func() { done <- gonsole.ServeListening(t.Context(), srv, timeouts, l, s.stop, j.logger()) }()
+	endsIdleOn(t, startOf(l, timeouts))
+}
 
-	err := ended(t, done, timeouts)
+// endsIdleOn fails t unless the start s ends unprompted with nil, logging the idle exit first.
+func endsIdleOn(t *testing.T, s start) {
+	t.Helper()
+	j := newJournal()
+	var stopped stopper
+	done := make(chan error, 1)
+	go func() { done <- gonsole.ServeListening(t.Context(), s.srv, s.timeouts, s.at, stopped.stop, j.logger()) }()
+
+	err := ended(t, done, s.timeouts)
 
 	if err != nil {
 		t.Errorf("ServeListening() = %v, want nil once the idle exit passed", err)
 	}
-	if !s.ranOnceWithin(timeouts.StopGrace) {
+	if !stopped.ranOnceWithin(s.timeouts.StopGrace) {
 		t.Errorf("stop calls = %d, live %t, deadline in %v, want one live call within the stop grace",
-			s.calls, s.live, s.deadline)
+			stopped.calls, stopped.live, stopped.deadline)
 	}
-	idle := j.lineOf(`level=INFO msg="no connection for the idle exit" idle_exit=` + l.IdleExit.String())
+	idle := j.lineOf(`level=INFO msg="no connection for the idle exit" idle_exit=` + s.at.IdleExit.String())
 	if down := j.lineOf(`msg="shutting down"`); idle < 0 || down < idle {
 		t.Errorf("log = %q, want the idle line before the shutting down line", j.lines)
 	}
@@ -512,8 +535,6 @@ func TestServeListeningEndsAnIdleRunWithoutAnError(t *testing.T) {
 
 	noIdle := defaults
 	noIdle.Idle = 0
-	noRead := defaults
-	noRead.Read = 0
 	noHeader := defaults
 	noHeader.ReadHeader = 0
 	cases := []struct {
@@ -522,7 +543,6 @@ func TestServeListeningEndsAnIdleRunWithoutAnError(t *testing.T) {
 	}{
 		{"the default timeouts", defaults},
 		{"no idle timeout", noIdle},
-		{"no read timeout", noRead},
 		{"no read header timeout", noHeader},
 	}
 	for _, tc := range cases {
@@ -532,4 +552,42 @@ func TestServeListeningEndsAnIdleRunWithoutAnError(t *testing.T) {
 			endsIdle(t, gonsole.Listening{Address: "127.0.0.1:0", IdleExit: 50 * time.Millisecond}, tc.timeouts)
 		})
 	}
+}
+
+// boundedBy returns a server over the report names built from the default timeouts, then changed by change.
+func boundedBy(change func(*http.Server)) *http.Server {
+	srv := gonsole.NewServer("", reportNames(), defaults)
+	change(srv)
+	return srv
+}
+
+func TestServeListeningJudgesTheIdleExitOnTheServersTimeouts(t *testing.T) {
+	t.Parallel()
+
+	idleExit := gonsole.Listening{Address: "127.0.0.1:0", IdleExit: 50 * time.Millisecond}
+	cases := []struct {
+		name string
+		srv  *http.Server
+	}{
+		{"a server built with no timeouts", &http.Server{Handler: reportNames()}},
+		{"a server whose read timeout was cleared", boundedBy(func(srv *http.Server) { srv.ReadTimeout = 0 })},
+		{"a server whose idle timeout is negative", boundedBy(func(srv *http.Server) { srv.IdleTimeout = -time.Second })},
+		{"a server whose header timeout is negative",
+			boundedBy(func(srv *http.Server) { srv.ReadHeaderTimeout = -time.Second })},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			refusedOn(t, start{srv: tc.srv, timeouts: defaults, at: idleExit}, idleUnbounded)
+		})
+	}
+	t.Run("a bounded server beside timeouts that bound nothing", func(t *testing.T) {
+		t.Parallel()
+
+		unbounded := defaults
+		unbounded.ReadHeader, unbounded.Read, unbounded.Idle = 0, 0, 0
+
+		endsIdleOn(t, start{srv: gonsole.NewServer("", reportNames(), defaults), timeouts: unbounded, at: idleExit})
+	})
 }

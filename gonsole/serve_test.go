@@ -77,9 +77,10 @@ func TestNewServerCarriesTheTimeouts(t *testing.T) {
 	if srv.Addr != "127.0.0.1:8080" {
 		t.Errorf("Addr = %q, want 127.0.0.1:8080", srv.Addr)
 	}
-	if srv.ReadHeaderTimeout != defaults.ReadHeader || srv.ReadTimeout != defaults.Read ||
-		srv.IdleTimeout != defaults.Idle {
-		t.Errorf("timeouts = %v, %v, %v, want %+v", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.IdleTimeout, defaults)
+	carried := gonsole.Timeouts{ReadHeader: srv.ReadHeaderTimeout, Read: srv.ReadTimeout, Idle: srv.IdleTimeout}
+	want := gonsole.Timeouts{ReadHeader: defaults.ReadHeader, Read: defaults.Read, Idle: defaults.Idle}
+	if carried != want {
+		t.Errorf("timeouts = %+v, want %+v", carried, want)
 	}
 	if srv.WriteTimeout != 0 {
 		t.Errorf("WriteTimeout = %v, want none for open streams", srv.WriteTimeout)
@@ -291,6 +292,23 @@ func TestServeGivesStopItsOwnGrace(t *testing.T) {
 	}
 }
 
+// cancelledOnceTheGraceRanOut fails t unless causes holds a request's cancel by the grace, kept for the grace first.
+func cancelledOnceTheGraceRanOut(t *testing.T, causes <-chan error, kept *time.Duration, grace time.Duration) {
+	t.Helper()
+	select {
+	case cause := <-causes:
+		if !errors.Is(cause, gonsole.ErrGraceRanOut) {
+			t.Errorf("cause = %v, want the grace to have run out", cause)
+		}
+		if *kept < grace || *kept >= defaults.CancelGrace {
+			t.Errorf("request cancelled %v after the shutdown began, want once the grace of %v ran out, well within %v",
+				*kept, grace, defaults.CancelGrace)
+		}
+	default:
+		t.Errorf("the request was still running when Serve returned")
+	}
+}
+
 func TestServeCancelsARequestThatOutlastsTheGrace(t *testing.T) {
 	t.Parallel()
 
@@ -320,18 +338,7 @@ func TestServeCancelsARequestThatOutlastsTheGrace(t *testing.T) {
 	if err != nil {
 		t.Errorf("Serve() = %v, want nil once the cancelled request ended", err)
 	}
-	select {
-	case cause := <-causes:
-		if !errors.Is(cause, gonsole.ErrGraceRanOut) {
-			t.Errorf("cause = %v, want the grace to have run out", cause)
-		}
-		if kept < grace || kept >= defaults.CancelGrace {
-			t.Errorf("request cancelled %v after the shutdown began, want once the grace of %v ran out, well within %v",
-				kept, grace, defaults.CancelGrace)
-		}
-	default:
-		t.Errorf("the request was still running when Serve returned")
-	}
+	cancelledOnceTheGraceRanOut(t, causes, &kept, grace)
 	if !endedFirst || !s.ranOnceWithin(defaults.StopGrace) {
 		t.Errorf("request ended before stop %t, stop calls = %d, live %t, deadline in %v, want one live call after it",
 			endedFirst, s.calls, s.live, s.deadline)
@@ -371,7 +378,7 @@ func TestServeKeepsARequestsContextLiveThroughTheGrace(t *testing.T) {
 	}
 }
 
-func TestServeWaitsForAHijackedConnectionBeforeItStops(t *testing.T) {
+func TestServeWaitsForAConnectionAHandlerTakesOverBeforeItStops(t *testing.T) {
 	t.Parallel()
 
 	grace := 50 * time.Millisecond
@@ -379,11 +386,11 @@ func TestServeWaitsForAHijackedConnectionBeforeItStops(t *testing.T) {
 	arrived := make(chan struct{})
 	ended := make(chan struct{})
 	var kept time.Duration
-	hijacking := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	takingOver := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		connection, _, err := http.NewResponseController(w).Hijack()
 		close(arrived)
 		if err != nil {
-			t.Errorf("hijacking the connection: %v", err)
+			t.Errorf("taking the connection over: %v", err)
 			return
 		}
 		defer func() { _ = connection.Close() }()
@@ -400,7 +407,7 @@ func TestServeWaitsForAHijackedConnectionBeforeItStops(t *testing.T) {
 		}
 		return nil
 	}
-	address, end := serving(t, hijacking, grace, stop, j)
+	address, end := serving(t, takingOver, grace, stop, j)
 	client, err := net.Dial("tcp", address)
 	if err != nil {
 		t.Fatalf("dialling %s: %v", address, err)
@@ -412,10 +419,12 @@ func TestServeWaitsForAHijackedConnectionBeforeItStops(t *testing.T) {
 	err = end()
 
 	if err != nil || !endedFirst {
-		t.Errorf("Serve() = %v, hijacked request ended before stop %t, want nil after it ended", err, endedFirst)
+		t.Errorf("Serve() = %v, the request whose connection was taken over ended before stop %t, want nil after it ended",
+			err, endedFirst)
 	}
 	if kept < grace {
-		t.Errorf("hijacked request cancelled %v after the shutdown began, want the whole grace of %v first", kept, grace)
+		t.Errorf("the request whose connection was taken over was cancelled %v after the shutdown began, "+
+			"want the whole grace of %v first", kept, grace)
 	}
 }
 
@@ -600,10 +609,14 @@ func TestServeKeepsAConnectionsContextLiveThroughTheGrace(t *testing.T) {
 	kept := j.sinceDown()
 	served := ended(t, done, timeouts)
 
-	if kept < grace || !errors.Is(context.Cause(conn), gonsole.ErrGraceRanOut) || served != nil {
-		t.Errorf("connection context ended %v after the shutdown began with %v, Serve() = %v, "+
-			"want it live through the grace of %v, then ended by the grace running out, and nil",
-			kept, context.Cause(conn), served, grace)
+	if kept < grace {
+		t.Errorf("connection context ended %v after the shutdown began, want it live through the grace of %v", kept, grace)
+	}
+	if cause := context.Cause(conn); !errors.Is(cause, gonsole.ErrGraceRanOut) {
+		t.Errorf("connection context ended with %v, want it ended by the grace running out", cause)
+	}
+	if served != nil {
+		t.Errorf("Serve() = %v, want nil", served)
 	}
 }
 
@@ -759,9 +772,14 @@ func TestServeRefusesAGraceThatIsNotAboveZero(t *testing.T) {
 			if taken == nil {
 				_ = again.Close()
 			}
-			if errorText(err) != tc.err || j.said("msg=listening") || taken != nil || s.calls != 0 {
-				t.Errorf("Serve() = %q, listened %t, port taken %v, stop calls %d, want %q with nothing bound or stopped",
-					errorText(err), j.said("msg=listening"), taken, s.calls, tc.err)
+			if errorText(err) != tc.err {
+				t.Errorf("Serve() = %q, want %q", errorText(err), tc.err)
+			}
+			if j.said("msg=listening") || s.calls != 0 {
+				t.Errorf("listened %t, stop calls %d, want nothing bound or stopped", j.said("msg=listening"), s.calls)
+			}
+			if taken != nil {
+				t.Errorf("port taken %v, want it left free", taken)
 			}
 		})
 	}

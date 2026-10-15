@@ -4,6 +4,7 @@ package gonsole
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -30,14 +31,9 @@ func newIdler(run context.Context, end context.CancelFunc, window time.Duration,
 	return idle
 }
 
-// see counts a connection from its new state until it closes or is hijacked.
-func (i *idler) see(_ net.Conn, state http.ConnState) {
-	switch state {
-	case http.StateNew:
-		i.hold()
-	case http.StateClosed, http.StateHijacked:
-		i.release()
-	}
+// counting returns listener with each connection it accepts counted open until that connection's first close.
+func (i *idler) counting(listener net.Listener) net.Listener {
+	return countedListener{Listener: listener, idle: i}
 }
 
 // wrap returns next, counting each request while it runs.
@@ -89,27 +85,73 @@ func (i *idler) stop() {
 	i.end()
 }
 
-// idling returns the run of srv under ctx, ending once nothing has been open for window, zero never, and its stop.
-func idling(
-	ctx context.Context, srv *http.Server, window time.Duration, logger *slog.Logger,
-) (context.Context, func()) {
-	if window == 0 {
-		return ctx, func() {}
+// idling returns the run of srv under ctx and listener counted for l's idle exit, zero never, with its stop.
+func (l Listening) idling(
+	ctx context.Context, srv *http.Server, listener net.Listener, logger *slog.Logger,
+) (context.Context, net.Listener, func()) {
+	if l.IdleExit == 0 {
+		return ctx, listener, func() {}
 	}
 	run, end := context.WithCancel(ctx)
-	idle := newIdler(run, end, window, logger)
-	srv.ConnState = chained(idle.see, srv.ConnState)
+	idle := newIdler(run, end, l.IdleExit, logger)
 	srv.Handler = idle.wrap(srv.Handler)
-	return run, idle.stop
+	return run, idle.counting(listener), idle.stop
 }
 
-// chained returns a hook that calls first and then second, first alone when second is nil.
-func chained(first, second func(net.Conn, http.ConnState)) func(net.Conn, http.ConnState) {
-	if second == nil {
-		return first
+// countedListener is a listener whose idler counts each connection it accepts until that connection's first close.
+type countedListener struct {
+	net.Listener
+	idle *idler
+}
+
+// Accept waits for the next connection and counts it open until its first close.
+func (c countedListener) Accept() (net.Conn, error) {
+	conn, err := c.Listener.Accept()
+	if err != nil {
+		return nil, err
 	}
-	return func(conn net.Conn, state http.ConnState) {
-		first(conn, state)
-		second(conn, state)
+	c.idle.hold()
+	return countedOnce(conn, sync.OnceFunc(c.idle.release)), nil
+}
+
+// closeWriter is a connection whose writing side closes alone.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// countedOnce returns conn calling closed when it closes, keeping its half close when it has one.
+func countedOnce(conn net.Conn, closed func()) net.Conn {
+	counted := countedConn{Conn: conn, closed: closed}
+	if half, ok := conn.(closeWriter); ok {
+		return halfClosingConn{countedConn: counted, half: half}
 	}
+	return counted
+}
+
+// countedConn is a connection that calls closed each time it closes.
+type countedConn struct {
+	net.Conn
+	closed func()
+}
+
+// Close closes the connection and calls closed.
+func (c countedConn) Close() error {
+	defer c.closed()
+	return c.Conn.Close()
+}
+
+// ReadFrom copies r into the connection as io.Copy does, keeping the connection's own sendfile path.
+func (c countedConn) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(c.Conn, r)
+}
+
+// halfClosingConn is a counted connection that keeps the half close of the connection it counts.
+type halfClosingConn struct {
+	countedConn
+	half closeWriter
+}
+
+// CloseWrite closes the writing side of the connection.
+func (c halfClosingConn) CloseWrite() error {
+	return c.half.CloseWrite()
 }

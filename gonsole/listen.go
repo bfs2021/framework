@@ -18,10 +18,10 @@ import (
 // highestPort is the highest port TCP names.
 const highestPort = 65535
 
-// errIdleUnbounded is the refusal of an idle exit while a connection can wait forever.
+// errIdleUnbounded is the refusal of an idle exit while a connection to the server can wait forever.
 var errIdleUnbounded = errors.New(
-	"gonsole: Listening.IdleExit needs Timeouts.Idle and Timeouts.ReadHeader above zero, " +
-		"or Timeouts.Read above zero to stand in for one at zero")
+	"gonsole: Listening.IdleExit needs the server's ReadTimeout above zero, " +
+		"and its IdleTimeout and ReadHeaderTimeout not negative")
 
 // Listening is where a server listens, whose visitor address it believes and when it stops for want of work.
 type Listening struct {
@@ -88,7 +88,7 @@ func ServeListening(
 	ctx context.Context, srv *http.Server, t Timeouts, l Listening, stop func(context.Context) error,
 	logger *slog.Logger,
 ) error {
-	if err := errors.Join(refuseGraces(t), refuseListening(l), refuseIdle(l, t)); err != nil {
+	if err := errors.Join(refuseGraces(t), refuseListening(l), refuseIdle(l, srv)); err != nil {
 		return err
 	}
 	listener, err := listenOn(ctx, l)
@@ -97,9 +97,9 @@ func ServeListening(
 	}
 	logger = cmp.Or(logger, slog.New(slog.DiscardHandler))
 	srv.Handler = visitors(l.ClientAddrHeader, cmp.Or[http.Handler](srv.Handler, http.DefaultServeMux), logger)
-	run, stopIdling := idling(ctx, srv, l.IdleExit, logger)
+	run, counted, stopIdling := l.idling(ctx, srv, listener, logger)
 	defer stopIdling()
-	return serveOn(run, srv, listener, t, stop, logger)
+	return serveOn(run, srv, counted, t, stop, logger)
 }
 
 // refuseListening returns an error naming each field of l that ServeListening cannot serve on.
@@ -120,20 +120,20 @@ func refuseListening(l Listening) error {
 	return errors.Join(refused...)
 }
 
-// refuseIdle refuses an idle exit of l below zero, or above zero while a connection under t can wait forever.
-func refuseIdle(l Listening, t Timeouts) error {
+// refuseIdle refuses an idle exit of l below zero, or above zero while a connection to srv can wait forever.
+func refuseIdle(l Listening, srv *http.Server) error {
 	switch {
 	case l.IdleExit < 0:
 		return fmt.Errorf("gonsole: Listening.IdleExit must not be negative, got %v", l.IdleExit)
-	case l.IdleExit > 0 && waitsForever(t):
+	case l.IdleExit > 0 && waitsForever(srv):
 		return errIdleUnbounded
 	}
 	return nil
 }
 
-// waitsForever reports whether no timeout of t bounds a connection's wait for its next request or its header.
-func waitsForever(t Timeouts) bool {
-	return cmp.Or(t.Idle, t.Read) <= 0 || cmp.Or(t.ReadHeader, t.Read) <= 0
+// waitsForever reports whether no timeout of srv bounds a connection's wait for its next request, header or body.
+func waitsForever(srv *http.Server) bool {
+	return srv.ReadTimeout <= 0 || min(srv.IdleTimeout, srv.ReadHeaderTimeout) < 0
 }
 
 // listenOn returns a listener on the network and address l names.
