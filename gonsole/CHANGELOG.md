@@ -17,6 +17,10 @@ Releases of this module are tagged `gonsole/vX.Y.Z`.
 - On a socket, `ServeListening` puts the visitor's address from the `CLIENT_ADDR_HEADER` header in `RemoteAddr`, and answers 400 when that header holds no single address.
 - `ServeListening` drops the `CLIENT_ADDR_HEADER` header from every request, TCP included.
 - `ServeListening` ends the run with no error once nothing has been open for `IDLE_EXIT`, so `serve` exits 0.
+- `ServeListening` takes an idle exit only when the server's `ReadTimeout` stands above zero and its `IdleTimeout` and `ReadHeaderTimeout` are not negative.
+- `ServeListening` counts a connection a handler takes over, such as a WebSocket, until it closes, so the idle exit waits for it.
+- On a socket, `ServeListening` holds a lock on `<socket>.lock` while the socket exists, so two starts at once never remove each other's socket.
+- A start that finds that lock taken stops with `a server already listens on <path>` when a server answers there, else with `another server is starting on <path>`.
 - `OverSocket`, whether a request came over a Unix socket.
 
 ## [0.7.0] - 2026-10-09
