@@ -5,8 +5,8 @@ package gonsole_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"slices"
@@ -35,17 +35,65 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// exampleEnvironment returns the environment of the example program, no inherited MYAPP_ variable and variables added.
+// settingEntry reports whether the environment entry sets a MYAPP_ variable or PORT.
+func settingEntry(entry string) bool {
+	return strings.HasPrefix(entry, "MYAPP_") || strings.HasPrefix(entry, "PORT=")
+}
+
+// exampleEnvironment returns the environment of the example program, no inherited setting and variables added.
 func exampleEnvironment(variables ...string) []string {
-	inherited := slices.DeleteFunc(os.Environ(), func(entry string) bool { return strings.HasPrefix(entry, "MYAPP_") })
+	inherited := slices.DeleteFunc(os.Environ(), settingEntry)
 	return append(append(inherited, exampleSwitch+"=1"), variables...)
+}
+
+// exampleBound is how long a test lets the example program run before it kills it.
+const exampleBound = 10 * time.Second
+
+// exampleCommand returns the example program over args and extra variables, killed once exampleBound passes.
+func exampleCommand(t *testing.T, variables []string, args ...string) *exec.Cmd {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), exampleBound)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, os.Args[0], args...)
+	cmd.Env = exampleEnvironment(variables...)
+	return cmd
+}
+
+// launch starts cmd and returns the lines of its stderr.
+func launch(t *testing.T, cmd *exec.Cmd) *bufio.Scanner {
+	t.Helper()
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("piping stderr: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting the example program: %v", err)
+	}
+	return bufio.NewScanner(stderr)
+}
+
+// untilExit returns every line left in lines.
+func untilExit(lines *bufio.Scanner) []string {
+	var left []string
+	for lines.Scan() {
+		left = append(left, lines.Text())
+	}
+	return left
+}
+
+// signalled sends signal to the started cmd and returns the lines it writes to stderr until it exits.
+func signalled(t *testing.T, cmd *exec.Cmd, lines *bufio.Scanner, signal os.Signal) []string {
+	t.Helper()
+	if err := cmd.Process.Signal(signal); err != nil {
+		t.Fatalf("signalling: %v", err)
+	}
+	return untilExit(lines)
 }
 
 // runExample runs the example program in its own process over args, stdin and extra variables and answers its output.
 func runExample(t *testing.T, stdin string, variables []string, args ...string) result {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), os.Args[0], args...)
-	cmd.Env = exampleEnvironment(variables...)
+	cmd := exampleCommand(t, variables, args...)
 	cmd.Stdin = strings.NewReader(stdin)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -91,8 +139,14 @@ func TestExamplePluginsDescribeTheDemoGroup(t *testing.T) {
 
 	loaded, err := p.Plugins(t.Context(), gonsole.Call{Describe: true, Env: gonsole.Env{Prefix: "MYAPP_"}})
 
-	if err != nil || loaded.Failed != nil || !slices.Equal(namespaces(loaded.Groups), []string{"demo"}) {
-		t.Fatalf("Plugins() = %v failing %v, %v, want demo, nil and nil", namespaces(loaded.Groups), loaded.Failed, err)
+	if err != nil {
+		t.Fatalf("Plugins() = %v, want nil", err)
+	}
+	if loaded.Failed != nil {
+		t.Fatalf("Plugins() failing %v, want nil", loaded.Failed)
+	}
+	if !slices.Equal(namespaces(loaded.Groups), []string{"demo"}) {
+		t.Fatalf("Plugins() = %v, want demo", namespaces(loaded.Groups))
 	}
 	if err := p.Check(loaded); err != nil {
 		t.Errorf("Check() = %v, want nil", err)
@@ -187,27 +241,13 @@ func TestMainServesUntilASignalEndsTheRun(t *testing.T) {
 		t.Run(signal.String(), func(t *testing.T) {
 			t.Parallel()
 
-			cmd := exec.CommandContext(t.Context(), os.Args[0], "serve")
-			cmd.Env = exampleEnvironment("MYAPP_ADDR=127.0.0.1:0")
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				t.Fatalf("piping stderr: %v", err)
-			}
-			if err := cmd.Start(); err != nil {
-				t.Fatalf("starting the example program: %v", err)
-			}
-			lines := bufio.NewScanner(stderr)
+			cmd := exampleCommand(t, []string{"MYAPP_ADDR=127.0.0.1:0"}, "serve")
+			lines := launch(t, cmd)
 			address := listeningAddress(t, lines)
 
 			body := get(t, address)
-			if err := cmd.Process.Signal(signal); err != nil {
-				t.Fatalf("signalling: %v", err)
-			}
-			var rest []string
-			for lines.Scan() {
-				rest = append(rest, lines.Text())
-			}
-			err = cmd.Wait()
+			rest := signalled(t, cmd, lines, signal)
+			err := cmd.Wait()
 
 			if err != nil {
 				t.Errorf("exit = %v, want 0", err)
@@ -222,34 +262,51 @@ func TestMainServesUntilASignalEndsTheRun(t *testing.T) {
 	}
 }
 
-func TestMainLetsASecondSignalEndACommandThatIgnoresTheFirst(t *testing.T) {
+func TestMainEndsAnIdleServeWithExitZero(t *testing.T) {
 	t.Parallel()
 
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "report:import", "-yes")
-	cmd.Env = exampleEnvironment()
+	got := runExample(t, "", []string{"MYAPP_ADDR=127.0.0.1:0", "MYAPP_IDLE_EXIT=200ms"}, "serve")
+
+	if got.code != gonsole.ExitDone {
+		t.Errorf("code = %d, want 0 within %v, stderr %q", got.code, exampleBound, got.stderr)
+	}
+	idle := strings.Index(got.stderr, `msg="no connection for the idle exit" idle_exit=200ms`)
+	if down := strings.Index(got.stderr, `msg="shutting down"`); idle < 0 || down < idle {
+		t.Errorf("stderr = %q, want the idle line before the shutting down line", got.stderr)
+	}
+}
+
+// importHeldOpen starts report:import -yes with its input held open and returns it and its exit once it reads.
+func importHeldOpen(t *testing.T) (*exec.Cmd, <-chan error) {
+	t.Helper()
+	cmd := exampleCommand(t, nil, "report:import", "-yes")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("piping stdin: %v", err)
 	}
-	defer func() { _ = stdin.Close() }()
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatalf("piping stderr: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting the example program: %v", err)
-	}
-	stuck := time.AfterFunc(10*time.Second, func() { _ = cmd.Process.Kill() })
-	defer stuck.Stop()
-	lines := bufio.NewScanner(stderr)
+	t.Cleanup(func() { _ = stdin.Close() })
+	lines := launch(t, cmd)
 	if !lines.Scan() || lines.Text() != importing {
 		t.Fatalf("stderr opens with %q, want %q before any signal", lines.Text(), importing)
 	}
 	exited := make(chan error, 1)
 	go func() {
-		_, _ = io.Copy(io.Discard, stderr)
+		untilExit(lines)
 		exited <- cmd.Wait()
 	}()
+	return cmd, exited
+}
+
+// killedBySignal reports whether a signal ended the process state describes.
+func killedBySignal(state *os.ProcessState) bool {
+	status, known := state.Sys().(syscall.WaitStatus)
+	return known && status.Signaled()
+}
+
+func TestMainLetsASecondSignalEndACommandThatIgnoresTheFirst(t *testing.T) {
+	t.Parallel()
+
+	cmd, exited := importHeldOpen(t)
 
 	_ = cmd.Process.Signal(os.Interrupt)
 	select {
@@ -261,8 +318,7 @@ func TestMainLetsASecondSignalEndACommandThatIgnoresTheFirst(t *testing.T) {
 
 	select {
 	case <-exited:
-		status, known := cmd.ProcessState.Sys().(syscall.WaitStatus)
-		if !known || !status.Signaled() {
+		if !killedBySignal(cmd.ProcessState) {
 			t.Errorf("state = %v, want the second signal to end the program", cmd.ProcessState)
 		}
 	case <-time.After(5 * time.Second):

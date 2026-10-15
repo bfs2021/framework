@@ -5,7 +5,6 @@ package exampleapp
 
 import (
 	"bufio"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -80,8 +79,12 @@ func serve(ctx context.Context, call gonsole.Call) error {
 	if err != nil {
 		return err
 	}
-	srv := gonsole.NewServer(cmp.Or(call.Env.Value("ADDR"), "localhost:8080"), http.HandlerFunc(answer), timeouts)
-	return gonsole.Serve(ctx, srv, timeouts, nil, slog.New(slog.NewTextHandler(call.Stderr, nil)))
+	listening, err := call.Env.Listening(gonsole.Listening{Address: "localhost:8080"})
+	if err != nil {
+		return err
+	}
+	srv := gonsole.NewServer("", http.HandlerFunc(answer), timeouts)
+	return gonsole.ServeListening(ctx, srv, timeouts, listening, nil, slog.New(slog.NewTextHandler(call.Stderr, nil)))
 }
 
 // answer writes the names of the reports.
