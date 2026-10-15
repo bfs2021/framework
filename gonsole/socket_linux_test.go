@@ -393,7 +393,8 @@ func TestServeListeningLeavesWhatIsNotASocket(t *testing.T) {
 		{"a symbolic link to a dead socket", "myapp.sock", linkToADeadSocket, notASocket},
 		{"a socket this account cannot connect to", "myapp.sock", lockedSocket,
 			"check the socket at %[1]s: dial unix %[1]s: connect: permission denied"},
-		{"a path under a regular file", "notes/myapp.sock", fileAbove, "lstat %[1]s: not a directory"},
+		{"a path under a regular file", "notes/myapp.sock", fileAbove,
+			"lock the socket at %[1]s: open %[1]s.lock: not a directory"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -417,7 +418,8 @@ func TestServeListeningStopsWhenTheSocketsFolderIsMissing(t *testing.T) {
 
 	path := place(filepath.Join(shortFolder(t), "missing", "myapp.sock"))
 
-	listenRefused(t, path.listening(), "http server: listen unix "+string(path)+": bind: no such file or directory")
+	listenRefused(t, path.listening(),
+		"http server: lock the socket at "+string(path)+": open "+string(path)+".lock: no such file or directory")
 }
 
 func TestServeListeningDrainsOverASocket(t *testing.T) {
