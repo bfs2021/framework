@@ -253,9 +253,16 @@ func TestAStatementPastItsDeadlineStops(t *testing.T) {
 // shareMustKeepTheRules fails the test unless connection i of a handle from testOptions carries every rule.
 func shareMustKeepTheRules(t *testing.T, i int, conn *sql.Conn) {
 	t.Helper()
+	shareMustReadTheRules(t, i, conn)
+	shareMustRefuseASchemaEdit(t, i, conn)
+}
+
+// shareMustReadTheRules fails the test unless every pragma of connection i reads the value of its rule.
+func shareMustReadTheRules(t *testing.T, i int, conn *sql.Conn) {
+	t.Helper()
 	pragmas := map[string]int64{
 		"PRAGMA foreign_keys": 1,
-		"PRAGMA busy_timeout": optionsBusyTimeout.Milliseconds(),
+		"PRAGMA busy_timeout": 0,
 		"PRAGMA temp_store":   2,
 		"PRAGMA cache_size":   -optionsCacheSize,
 		"PRAGMA synchronous":  1,
@@ -270,6 +277,11 @@ func shareMustKeepTheRules(t *testing.T, i int, conn *sql.Conn) {
 	if err := conn.QueryRowContext(t.Context(), "PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
 		t.Errorf("PRAGMA journal_mode on connection %d = %q, %v, want wal", i, mode, err)
 	}
+}
+
+// shareMustRefuseASchemaEdit fails the test unless connection i refuses an edit of the schema table.
+func shareMustRefuseASchemaEdit(t *testing.T, i int, conn *sql.Conn) {
+	t.Helper()
 	if _, err := conn.ExecContext(t.Context(), "PRAGMA writable_schema=ON"); err != nil {
 		t.Fatalf("PRAGMA writable_schema=ON on connection %d error = %v, want nil", i, err)
 	}
@@ -279,11 +291,9 @@ func shareMustKeepTheRules(t *testing.T, i int, conn *sql.Conn) {
 	}
 }
 
-func TestConnectionRulesHoldAfterShareStatements(t *testing.T) {
-	t.Parallel()
-
-	db := sqlitetest.Open(t, testOptions())
-	share := shareOn(t, db, shareOptions("rules-share"))
+// shareRulesTable creates the table of the rules test with one row through a transaction of share.
+func shareRulesTable(t *testing.T, share *dbkit.Share) {
+	t.Helper()
 	tx, err := share.Begin(t.Context())
 	if err != nil {
 		t.Fatalf("Begin() error = %v, want nil", err)
@@ -293,8 +303,14 @@ func TestConnectionRulesHoldAfterShareStatements(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit() error = %v, want nil", err)
 	}
+}
+
+// shareQueryOnEvery returns one result set through share on every connection of db.
+func shareQueryOnEvery(t *testing.T, db *sql.DB, share *dbkit.Share) []*dbkit.Rows {
+	t.Helper()
 	held := make([]*dbkit.Rows, optionsMaxConns)
 	for i := range held {
+		var err error
 		if held[i], err = share.Query(t.Context(), "SELECT a FROM share_rules WHERE a = $1", 1); err != nil {
 			t.Fatalf("Query() error = %v, want nil", err)
 		}
@@ -303,11 +319,26 @@ func TestConnectionRulesHoldAfterShareStatements(t *testing.T) {
 		t.Fatalf("Stats().OpenConnections = %d while the share holds %d result sets, want %d", got, len(held),
 			optionsMaxConns)
 	}
+	return held
+}
+
+// shareCloseAll closes every result set of held and fails the test when one cannot.
+func shareCloseAll(t *testing.T, held []*dbkit.Rows) {
+	t.Helper()
 	for _, rows := range held {
 		if err := rows.Close(); err != nil {
 			t.Fatalf("Close() error = %v, want nil", err)
 		}
 	}
+}
+
+func TestConnectionRulesHoldAfterShareStatements(t *testing.T) {
+	t.Parallel()
+
+	db := sqlitetest.Open(t, testOptions())
+	share := shareOn(t, db, shareOptions("rules-share"))
+	shareRulesTable(t, share)
+	shareCloseAll(t, shareQueryOnEvery(t, db, share))
 
 	for i, conn := range rulesConns(t, db) {
 		shareMustKeepTheRules(t, i, conn)

@@ -6,12 +6,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	modernc "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -19,8 +21,12 @@ import (
 	"github.com/gopherium/framework/dbkit"
 )
 
-// internalLateTarget is what a file that appears at the target between the copy and the move holds.
-const internalLateTarget = "a file written between the copy and the move"
+const (
+	// internalLateTarget is what a file that appears at the target between the copy and the move holds.
+	internalLateTarget = "a file written between the copy and the move"
+	// internalCheckpointDeadline is the deadline of a checkpoint behind a held writer.
+	internalCheckpointDeadline = 100 * time.Millisecond
+)
 
 var (
 	// errSnapshotSyncFailed is the error a chosen sync answers with.
@@ -42,7 +48,13 @@ func internalFolder(t *testing.T) string {
 // internalSnapshotOpen returns a handle on a fresh file holding one row, and an empty folder for the targets.
 func internalSnapshotOpen(t *testing.T) (*sql.DB, string) {
 	t.Helper()
-	db, err := Open("sqlite:"+filepath.Join(internalFolder(t), "site.db"), internalOptions())
+	return internalSnapshotOpenWith(t, internalOptions())
+}
+
+// internalSnapshotOpenWith returns a handle with opts on a fresh file holding one row, and an empty target folder.
+func internalSnapshotOpenWith(t *testing.T, opts Options) (*sql.DB, string) {
+	t.Helper()
+	db, err := Open("sqlite:"+filepath.Join(internalFolder(t), "site.db"), opts)
 	if err != nil {
 		t.Fatalf("Open() error = %v, want nil", err)
 	}
@@ -105,6 +117,36 @@ func internalMustFailCheck(t *testing.T, path, want string) {
 	}
 }
 
+func TestACheckpointEndsWithItsContext(t *testing.T) {
+	t.Parallel()
+
+	opts := internalOptions()
+	opts.BusyTimeout = internalLongBusyTimeout
+	db, _ := internalSnapshotOpenWith(t, opts)
+	writer, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = writer.Rollback() })
+	if _, err := writer.ExecContext(t.Context(), "INSERT INTO snapshot_rows VALUES (2)"); err != nil {
+		t.Fatalf("ExecContext() error = %v, want nil", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), internalCheckpointDeadline)
+	defer cancel()
+	began := time.Now()
+
+	_, err = (&snapshotter{db: db}).checkpoint(ctx)
+
+	waited := time.Since(began)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("checkpoint() error = %v, want one matching context.DeadlineExceeded", err)
+	}
+	if waited > internalLongBusyTimeout/10 {
+		t.Errorf("checkpoint() answered after %v, want within a tenth of the busy timeout %v", waited,
+			internalLongBusyTimeout)
+	}
+}
+
 func TestACopyWithNoPagesFailsTheCheck(t *testing.T) {
 	t.Parallel()
 
@@ -151,8 +193,40 @@ func TestACopyThatIsNoDatabaseFailsTheCheck(t *testing.T) {
 
 	var driverErr *modernc.Error
 	want := "dbkit: check the snapshot copy " + path + ": "
-	if !errors.As(err, &driverErr) || driverErr.Code() != sqlite3.SQLITE_NOTADB || !strings.HasPrefix(err.Error(), want) {
+	if !errors.As(err, &driverErr) {
+		t.Fatalf("checkCopy() error = %v, want a driver error", err)
+	}
+	if driverErr.Code() != sqlite3.SQLITE_NOTADB || !strings.HasPrefix(err.Error(), want) {
 		t.Errorf("checkCopy() error = %v, want SQLITE_NOTADB in an error starting %q", err, want)
+	}
+}
+
+// internalAnswer is what a call of Snapshot answered.
+type internalAnswer struct {
+	// snap is the snapshot of the call.
+	snap dbkit.Snapshot
+	// err is the error of the call.
+	err error
+}
+
+// internalSnapshotTo runs a snapshot of db to target and returns what it answered.
+func internalSnapshotTo(t *testing.T, db *sql.DB, target string) internalAnswer {
+	t.Helper()
+	snap, err := NewSnapshotter(db).Snapshot(t.Context(), target)
+	return internalAnswer{snap: snap, err: err}
+}
+
+// internalMustAnswer fails the test unless got holds the snapshot of want and an error matching it that reads text.
+func internalMustAnswer(t *testing.T, got, want internalAnswer, text string) {
+	t.Helper()
+	if got.snap != want.snap {
+		t.Errorf("Snapshot() = %+v, want %+v", got.snap, want.snap)
+	}
+	if !errors.Is(got.err, want.err) {
+		t.Errorf("Snapshot() error = %v, want one matching %v", got.err, want.err)
+	}
+	if read := fmt.Sprint(got.err); read != text {
+		t.Errorf("Snapshot() error = %s, want %q", read, text)
 	}
 }
 
@@ -197,12 +271,10 @@ func TestAFailedCopySyncLeavesNoTarget(t *testing.T) {
 	target := filepath.Join(folder, "copy.db")
 	internalFailSync(t, target+partialSuffix)
 
-	got, err := NewSnapshotter(db).Snapshot(t.Context(), target)
+	got := internalSnapshotTo(t, db, target)
 
-	want := "dbkit: sync the snapshot copy " + target + partialSuffix + ": " + errSnapshotSyncFailed.Error()
-	if !errors.Is(err, errSnapshotSyncFailed) || err.Error() != want || got != (dbkit.Snapshot{}) {
-		t.Errorf("Snapshot() = %+v, %v, want no snapshot and %q", got, err, want)
-	}
+	internalMustAnswer(t, got, internalAnswer{err: errSnapshotSyncFailed},
+		"dbkit: sync the snapshot copy "+target+partialSuffix+": "+errSnapshotSyncFailed.Error())
 	internalMustHoldOnly(t, folder, snapshotLockFile)
 }
 
@@ -213,12 +285,10 @@ func TestAFailedMoveLeavesNoTarget(t *testing.T) {
 	rename = func(string, string) error { return errSnapshotMoveFailed }
 	t.Cleanup(func() { rename = kept })
 
-	got, err := NewSnapshotter(db).Snapshot(t.Context(), target)
+	got := internalSnapshotTo(t, db, target)
 
-	want := "dbkit: move the snapshot copy to " + target + ": " + errSnapshotMoveFailed.Error()
-	if !errors.Is(err, errSnapshotMoveFailed) || err.Error() != want || got != (dbkit.Snapshot{}) {
-		t.Errorf("Snapshot() = %+v, %v, want no snapshot and %q", got, err, want)
-	}
+	internalMustAnswer(t, got, internalAnswer{err: errSnapshotMoveFailed},
+		"dbkit: move the snapshot copy to "+target+": "+errSnapshotMoveFailed.Error())
 	internalMustHoldOnly(t, folder, snapshotLockFile)
 }
 
@@ -246,14 +316,11 @@ func TestASecondSnapshotInTheFolderKeepsTheFirstCopy(t *testing.T) {
 		t.Fatalf("the first Snapshot() returned %v before its move", err)
 	}
 
-	got, err := NewSnapshotter(db).Snapshot(t.Context(), second)
+	got := internalSnapshotTo(t, db, second)
 
 	close(proceed)
-	want := "dbkit: take the snapshot lock " + filepath.Join(folder, snapshotLockFile) + ": " +
-		ErrSnapshotRunning.Error()
-	if !errors.Is(err, ErrSnapshotRunning) || err.Error() != want || got != (dbkit.Snapshot{}) {
-		t.Errorf("the second Snapshot() = %+v, %v, want no snapshot and %q", got, err, want)
-	}
+	internalMustAnswer(t, got, internalAnswer{err: ErrSnapshotRunning},
+		"dbkit: take the snapshot lock "+filepath.Join(folder, snapshotLockFile)+": "+ErrSnapshotRunning.Error())
 	if err := <-result; err != nil {
 		t.Errorf("the first Snapshot() error = %v, want nil", err)
 	}
@@ -274,9 +341,11 @@ func TestSnapshotKeepsATargetMadeDuringTheCopy(t *testing.T) {
 
 	got, err := NewSnapshotter(db).Snapshot(t.Context(), target)
 
-	want := "dbkit: the snapshot target " + target + " already exists"
-	if err == nil || err.Error() != want || got != (dbkit.Snapshot{}) {
-		t.Errorf("Snapshot() = %+v, %v, want no snapshot and %q", got, err, want)
+	if got != (dbkit.Snapshot{}) {
+		t.Errorf("Snapshot() = %+v, want no snapshot", got)
+	}
+	if read, want := fmt.Sprint(err), "dbkit: the snapshot target "+target+" already exists"; read != want {
+		t.Errorf("Snapshot() error = %s, want %q", read, want)
 	}
 	if data, err := os.ReadFile(target); err != nil || string(data) != internalLateTarget {
 		t.Errorf("the target holds %d bytes, %v after the snapshot, want the %d bytes written during the copy",
@@ -290,11 +359,9 @@ func TestAFailedFolderSyncKeepsTheCopy(t *testing.T) {
 	target := filepath.Join(folder, "copy.db")
 	internalFailSync(t, folder)
 
-	got, err := NewSnapshotter(db).Snapshot(t.Context(), target)
+	got := internalSnapshotTo(t, db, target)
 
-	want := "dbkit: sync the folder of the snapshot " + target + ": " + errSnapshotSyncFailed.Error()
-	if !errors.Is(err, errSnapshotSyncFailed) || err.Error() != want || got != (dbkit.Snapshot{Path: target}) {
-		t.Errorf("Snapshot() = %+v, %v, want the path %s with no checkpoint and %q", got, err, target, want)
-	}
+	internalMustAnswer(t, got, internalAnswer{snap: dbkit.Snapshot{Path: target}, err: errSnapshotSyncFailed},
+		"dbkit: sync the folder of the snapshot "+target+": "+errSnapshotSyncFailed.Error())
 	internalMustHoldOnly(t, folder, snapshotLockFile, "copy.db")
 }

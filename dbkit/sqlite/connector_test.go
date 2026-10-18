@@ -26,6 +26,8 @@ const (
 	connectorHold = 100 * time.Millisecond
 	// connectorDeadline is the deadline of a first open behind a writer that never lets go.
 	connectorDeadline = 100 * time.Millisecond
+	// connectorWaitDeadline is the deadline of a new connection's wait behind a held writer.
+	connectorWaitDeadline = 100 * time.Millisecond
 	// connectorShortBusyTimeout is a busy timeout a first open waits out on purpose.
 	connectorShortBusyTimeout = 300 * time.Millisecond
 	// connectorShortBusyPoll is how often a first open that waits out connectorShortBusyTimeout tries again.
@@ -115,14 +117,29 @@ func TestANewConnectionOpensWhileAWriterHoldsTheLock(t *testing.T) {
 	if took > optionsBusyTimeout/2 {
 		t.Errorf("Conn() took %v, want well inside the busy timeout %v", took, optionsBusyTimeout)
 	}
-	var busy int64
-	if err := conn.QueryRowContext(t.Context(), "PRAGMA busy_timeout").Scan(&busy); err != nil {
-		t.Fatalf("PRAGMA busy_timeout error = %v, want nil", err)
-	}
-	if busy != optionsBusyTimeout.Milliseconds() {
-		t.Errorf("PRAGMA busy_timeout = %d, want %d set back after the optimize", busy, optionsBusyTimeout.Milliseconds())
-	}
+	connectorMustWaitWithItsContext(t, conn)
 	connectorMustSkip(t, records, path)
+}
+
+// connectorMustWaitWithItsContext fails the test unless conn reads busy_timeout 0 and its wait ends at its deadline.
+func connectorMustWaitWithItsContext(t *testing.T, conn *sql.Conn) {
+	t.Helper()
+	var busy int64
+	if err := conn.QueryRowContext(t.Context(), "PRAGMA busy_timeout").Scan(&busy); err != nil || busy != 0 {
+		t.Errorf("PRAGMA busy_timeout = %d, %v, want 0 with dbkit's busy handler in place of SQLite's", busy, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), connectorWaitDeadline)
+	defer cancel()
+
+	waited, err := rulesBegin(ctx, conn)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("BeginTx() on the new connection error = %v, want one matching context.DeadlineExceeded", err)
+	}
+	if waited > optionsBusyTimeout/10 {
+		t.Errorf("BeginTx() on the new connection answered after %v, want within a tenth of the busy timeout %v",
+			waited, optionsBusyTimeout)
+	}
 }
 
 func TestAnOptimizeWithNoWriterLeavesNoNote(t *testing.T) {

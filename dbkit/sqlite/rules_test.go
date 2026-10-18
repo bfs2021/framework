@@ -95,13 +95,51 @@ func TestJournalModeIsWAL(t *testing.T) {
 	rulesMustAll(t, "PRAGMA journal_mode", rulesRead[string](t, db, "PRAGMA journal_mode"), "wal")
 }
 
-func TestBusyTimeoutIsTheOption(t *testing.T) {
+// rulesHeldElsewhere returns a handle with opts on a file whose writer on a second handle holds the lock until cleanup.
+func rulesHeldElsewhere(t *testing.T, opts sqlite.Options) *sql.DB {
+	t.Helper()
+	address, _ := testAddress(t)
+	db, holder := mustOpen(t, address, opts), mustOpen(t, address, opts)
+	rulesExec(t, holder, "CREATE TABLE held_rows (a INTEGER)")
+	rulesHoldWriter(t, holder, "INSERT INTO held_rows VALUES (1)")
+	return db
+}
+
+// rulesBegin returns how long BeginTx ran on conn under ctx and its error, rolling back any transaction it got.
+func rulesBegin(ctx context.Context, conn *sql.Conn) (time.Duration, error) {
+	began := time.Now()
+	tx, err := conn.BeginTx(ctx, nil)
+	waited := time.Since(began)
+	if err == nil {
+		_ = tx.Rollback()
+	}
+	return waited, err
+}
+
+func TestEveryConnectionWaitsTheBusyTimeout(t *testing.T) {
 	t.Parallel()
 
-	db := rulesOpen(t, testOptions())
+	opts := testOptions()
+	opts.BusyTimeout = rulesShortBusyTimeout
+	db := rulesHeldElsewhere(t, opts)
 
-	rulesMustAll(t, "PRAGMA busy_timeout", rulesRead[int64](t, db, "PRAGMA busy_timeout"),
-		optionsBusyTimeout.Milliseconds())
+	for i, conn := range rulesConns(t, db) {
+		var timeout int64
+		if err := conn.QueryRowContext(t.Context(), "PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 0 {
+			t.Errorf("PRAGMA busy_timeout on connection %d = %d, %v, want 0 with dbkit's busy handler in place of SQLite's",
+				i, timeout, err)
+		}
+
+		waited, err := rulesBegin(t.Context(), conn)
+
+		if !errors.Is(sqlite.Classify(err), dbkit.ErrBusy) {
+			t.Errorf("BeginTx() on connection %d error = %v, want busy while another handle holds the lock", i, err)
+		}
+		if waited < rulesShortBusyTimeout {
+			t.Errorf("BeginTx() on connection %d answered after %v, want at least the busy timeout %v", i, waited,
+				rulesShortBusyTimeout)
+		}
+	}
 }
 
 func TestTempStoreIsMemory(t *testing.T) {

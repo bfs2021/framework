@@ -7,7 +7,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"log/slog"
-	"strconv"
 	"sync"
 	"time"
 
@@ -38,12 +37,12 @@ type connector struct {
 	name string
 	// path is the absolute path of the file.
 	path string
-	// restore sets a connection's busy timeout back to the option.
-	restore string
-	// busyTimeout is how long a busy open keeps trying.
+	// busyTimeout is how long a busy open or a connection waiting for a lock keeps trying.
 	busyTimeout time.Duration
-	// busyPoll is how often a busy open tries again.
+	// busyPoll is how often a busy open or a connection waiting for a lock tries again.
 	busyPoll time.Duration
+	// wait makes the waits of a new connection end with their context.
+	wait func(conn driver.Conn) (driver.Conn, error)
 	// logger receives the skipped optimize notes.
 	logger *slog.Logger
 }
@@ -54,19 +53,20 @@ func newConnector(drv *modernc.Driver, path string, opts Options) *connector {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &connector{
+	c := &connector{
 		driver:      drv,
 		open:        drv.Open,
 		name:        connectionString(path, opts),
 		path:        path,
-		restore:     "PRAGMA busy_timeout=" + strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10),
 		busyTimeout: opts.BusyTimeout,
 		busyPoll:    opts.BusyPoll,
 		logger:      logger,
 	}
+	c.wait = c.waitOn
+	return c
 }
 
-// Connect opens one connection, waiting while the open answers busy, optimizes it and passes it through the seam.
+// Connect opens one connection, waiting while busy, optimizes it, ends its waits with ctx and passes it to the seam.
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -78,7 +78,11 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := c.optimize(ctx, conn.(driver.ExecerContext)); err != nil {
 		return nil, errors.Join(err, conn.Close())
 	}
-	return seam.Wrap(c.path, conn), nil
+	waiting, err := c.wait(conn)
+	if err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
+	return seam.Wrap(c.path, waiting), nil
 }
 
 // openWaiting opens one connection, trying again every busy poll while busy, until the busy timeout passes or ctx ends.
@@ -118,14 +122,11 @@ func (c *connector) Driver() driver.Driver {
 	return c.driver
 }
 
-// optimize runs PRAGMA optimize on conn and skips a busy answer with a note.
+// optimize lowers the busy timeout of conn, runs PRAGMA optimize and skips a busy answer with a note.
 func (c *connector) optimize(ctx context.Context, conn driver.ExecerContext) error {
 	_, err := conn.ExecContext(ctx, lowerBusyTimeout, nil)
 	if err == nil {
 		_, err = conn.ExecContext(ctx, optimizeStatement, nil)
-	}
-	if _, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), c.restore, nil); restoreErr != nil {
-		return errors.Join(err, restoreErr)
 	}
 	if errors.Is(Classify(err), dbkit.ErrBusy) {
 		c.logger.InfoContext(ctx, optimizeSkipped, slog.String("path", c.path), slog.Any("error", err))

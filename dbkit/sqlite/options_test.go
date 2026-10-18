@@ -182,6 +182,6 @@ func TestOpenKeepsTheLargestValues(t *testing.T) {
 
 	busy, cache := rulesOpen(t, opts), rulesOpen(t, opts)
 
-	rulesMustAll(t, "PRAGMA busy_timeout", rulesRead[int64](t, busy, "PRAGMA busy_timeout"), math.MaxInt32)
+	mustPing(t, busy)
 	rulesMustAll(t, "PRAGMA cache_size", rulesRead[int64](t, cache, "PRAGMA cache_size"), -math.MaxInt32)
 }
