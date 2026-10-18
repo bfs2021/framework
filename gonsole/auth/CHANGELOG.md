@@ -8,6 +8,17 @@ v0.x, minor releases may contain breaking changes.
 
 Releases of this module are tagged `gonsole/auth/vX.Y.Z`.
 
+## [Unreleased]
+
+### Added
+
+- `DeclaredRoles`, the `Config.Roles` hook that registers the plugins, then answers a registry's roles, privileged where they carry one capability, and fails when no role carries it.
+
+### Changed
+
+- **Breaking.** `account:enable` refuses an account holding no role or one the roles do not declare, until it holds a declared role.
+- `account:role`, `account:disable` and `account:enable` fail when the account's role changed after their check.
+
 ## [0.8.0] - 2026-10-13
 
 ### Changed

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gopherium/gouncer"
+	"github.com/gopherium/gouncer/authkit"
 
 	"github.com/gopherium/framework/gonsole"
 )
@@ -52,8 +53,8 @@ func setRole(ctx context.Context, call gonsole.Call, cfg Config) error {
 			_, err := fmt.Fprintf(call.Stdout, "would set %s to %s\n", held.Email, role)
 			return err
 		}
-		if err := store.SetUserRole(ctx, held.ID, role, roles.Privileged); err != nil {
-			return uncovered(held.Email, err)
+		if err := store.SetUserRoleFrom(ctx, held.ID, held.Role, role, roles.Privileged); err != nil {
+			return written(held.Email, err)
 		}
 		_, err = fmt.Fprintf(call.Stdout, "set %s to %s\n", held.Email, role)
 		return err
@@ -63,6 +64,14 @@ func setRole(ctx context.Context, call gonsole.Call, cfg Config) error {
 // address returns typed as gouncer stores an address, trimmed and in lower case.
 func address(typed string) string {
 	return strings.ToLower(strings.TrimSpace(typed))
+}
+
+// written returns err, worded for an operator when the role moved since the check or no privileged account remains.
+func written(email string, err error) error {
+	if errors.Is(err, authkit.ErrRoleChanged) {
+		return fmt.Errorf("the role of %s changed after the check, run the command again", email)
+	}
+	return uncovered(email, err)
 }
 
 // uncovered returns err, worded for an operator when it refuses to remove the last privileged account.
