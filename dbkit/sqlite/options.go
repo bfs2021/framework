@@ -34,10 +34,12 @@ func (s Synchronous) pragma() string {
 	return "FULL"
 }
 
-// Options configures one SQLite handle. BusyTimeout, CacheSize, MaxConns and Synchronous are required.
+// Options configures one SQLite handle. BusyTimeout, BusyPoll, CacheSize, MaxConns and Synchronous are required.
 type Options struct {
 	// BusyTimeout is how long a connection waits for a lock, from 1ms to 596h31m23.647s.
 	BusyTimeout time.Duration
+	// BusyPoll is how often a connection waiting for a lock tries it again, from 1ms up to BusyTimeout.
+	BusyPoll time.Duration
 	// CacheSize is the page cache of each connection in kibibytes, from 1 to 2147483647.
 	CacheSize int
 	// MaxConns caps the open and idle connections, 2 or more, each holding a page cache of CacheSize.
@@ -66,11 +68,10 @@ func (o Options) check() error {
 
 // checkRequired returns the error for the first required option that is missing or outside its range.
 func (o Options) checkRequired() error {
+	if err := o.checkWaits(); err != nil {
+		return err
+	}
 	switch {
-	case o.BusyTimeout < time.Millisecond:
-		return fmt.Errorf("dbkit: the option BusyTimeout must be 1ms or more, got %v", o.BusyTimeout)
-	case o.BusyTimeout > maxBusyTimeout:
-		return fmt.Errorf("dbkit: the option BusyTimeout must be %v or less, got %v", maxBusyTimeout, o.BusyTimeout)
 	case o.CacheSize < 1:
 		return fmt.Errorf("dbkit: the option CacheSize must stand above zero, got %d", o.CacheSize)
 	case o.CacheSize > math.MaxInt32:
@@ -80,6 +81,22 @@ func (o Options) checkRequired() error {
 	case o.Synchronous != SynchronousNormal && o.Synchronous != SynchronousFull:
 		return fmt.Errorf("dbkit: the option Synchronous must be SynchronousNormal or SynchronousFull, got %d",
 			o.Synchronous)
+	}
+	return nil
+}
+
+// checkWaits returns the error for a busy timeout or a busy poll that is missing or outside its range.
+func (o Options) checkWaits() error {
+	switch {
+	case o.BusyTimeout < time.Millisecond:
+		return fmt.Errorf("dbkit: the option BusyTimeout must be 1ms or more, got %v", o.BusyTimeout)
+	case o.BusyTimeout > maxBusyTimeout:
+		return fmt.Errorf("dbkit: the option BusyTimeout must be %v or less, got %v", maxBusyTimeout, o.BusyTimeout)
+	case o.BusyPoll < time.Millisecond:
+		return fmt.Errorf("dbkit: the option BusyPoll must be 1ms or more, got %v", o.BusyPoll)
+	case o.BusyPoll > o.BusyTimeout:
+		return fmt.Errorf("dbkit: the option BusyPoll must be the BusyTimeout of %v or less, got %v",
+			o.BusyTimeout, o.BusyPoll)
 	}
 	return nil
 }

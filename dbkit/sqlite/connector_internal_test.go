@@ -20,6 +20,8 @@ const (
 	internalOptimize = "PRAGMA optimize=0x10002"
 	// internalRestore is the statement that sets internalOptions' busy timeout back.
 	internalRestore = "PRAGMA busy_timeout=1500"
+	// internalBusyPoll is the busy poll of internalOptions, the smallest Open accepts.
+	internalBusyPoll = time.Millisecond
 )
 
 var (
@@ -31,8 +33,8 @@ var (
 
 // internalOptions returns options with every required value set and Create on.
 func internalOptions() Options {
-	return Options{BusyTimeout: 1500 * time.Millisecond, CacheSize: 1, MaxConns: 2, Synchronous: SynchronousNormal,
-		Create: true}
+	return Options{BusyTimeout: 1500 * time.Millisecond, BusyPoll: internalBusyPoll, CacheSize: 1, MaxConns: 2,
+		Synchronous: SynchronousNormal, Create: true}
 }
 
 // internalConn is a connection that records its statements and fails the chosen ones.
@@ -110,8 +112,11 @@ func TestConnectRefusesAnEndedContext(t *testing.T) {
 
 	conn, err := c.Connect(ctx)
 
-	if !errors.Is(err, context.Canceled) || conn != nil || *opened != 0 {
-		t.Errorf("Connect() = %v, %v after %d opens, want nil, context.Canceled and no open", conn, err, *opened)
+	if !errors.Is(err, context.Canceled) || conn != nil {
+		t.Errorf("Connect() = %v, %v, want nil and context.Canceled", conn, err)
+	}
+	if *opened != 0 {
+		t.Errorf("opens = %d, want no open", *opened)
 	}
 }
 
@@ -135,8 +140,11 @@ func TestTheOptimizeStepRunsInOrder(t *testing.T) {
 
 	conn, err := c.Connect(t.Context())
 
-	if err != nil || conn != fake || fake.closed {
-		t.Errorf("Connect() = %v, %v, closed %v, want the open connection", conn, err, fake.closed)
+	if err != nil || conn != fake {
+		t.Errorf("Connect() = %v, %v, want the open connection", conn, err)
+	}
+	if fake.closed {
+		t.Errorf("closed = %v, want the open connection left open", fake.closed)
 	}
 	internalMustRun(t, fake, internalLower, internalOptimize, internalRestore)
 }
@@ -161,9 +169,11 @@ func TestAFailedStepClosesTheConnection(t *testing.T) {
 
 			conn, err := connector.Connect(t.Context())
 
-			if !errors.Is(err, errStepFailed) || conn != nil || !fake.closed {
-				t.Errorf("Connect() = %v, %v, closed %v, want nil, the step's error and a closed connection",
-					conn, err, fake.closed)
+			if !errors.Is(err, errStepFailed) || conn != nil {
+				t.Errorf("Connect() = %v, %v, want nil and the step's error", conn, err)
+			}
+			if !fake.closed {
+				t.Errorf("closed = %v, want the connection closed", fake.closed)
 			}
 			internalMustRun(t, fake, c.ran...)
 		})

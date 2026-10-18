@@ -16,6 +16,8 @@ import (
 const (
 	// optionsBusyTimeout is a busy timeout no uncontended test waits out.
 	optionsBusyTimeout = 20017 * time.Millisecond
+	// optionsBusyPoll is the busy poll the tests pass, the smallest Open accepts.
+	optionsBusyPoll = time.Millisecond
 	// optionsCacheSize is the page cache in kibibytes the tests pass.
 	optionsCacheSize = 1536
 	// optionsMaxConns is the connection cap the tests pass.
@@ -30,6 +32,7 @@ const (
 func testOptions() sqlite.Options {
 	return sqlite.Options{
 		BusyTimeout: optionsBusyTimeout,
+		BusyPoll:    optionsBusyPoll,
 		CacheSize:   optionsCacheSize,
 		MaxConns:    optionsMaxConns,
 		Synchronous: sqlite.SynchronousNormal,
@@ -78,6 +81,19 @@ func TestOpenRefusesABadOption(t *testing.T) {
 			"dbkit: the option BusyTimeout must be 596h31m23.647s or less, got 596h31m23.647000001s"},
 		{"the longest busy timeout", func(o *sqlite.Options) { o.BusyTimeout = math.MaxInt64 },
 			"dbkit: the option BusyTimeout must be 596h31m23.647s or less, got 2562047h47m16.854775807s"},
+		{"a missing busy poll", func(o *sqlite.Options) { o.BusyPoll = 0 },
+			"dbkit: the option BusyPoll must be 1ms or more, got 0s"},
+		{"a negative busy poll", func(o *sqlite.Options) { o.BusyPoll = -time.Millisecond },
+			"dbkit: the option BusyPoll must be 1ms or more, got -1ms"},
+		{"a busy poll below a millisecond", func(o *sqlite.Options) { o.BusyPoll = time.Millisecond - 1 },
+			"dbkit: the option BusyPoll must be 1ms or more, got 999.999µs"},
+		{"a busy poll past the busy timeout", func(o *sqlite.Options) { o.BusyPoll = optionsBusyTimeout + time.Millisecond },
+			"dbkit: the option BusyPoll must be the BusyTimeout of 20.017s or less, got 20.018s"},
+		{"a busy poll a nanosecond past the busy timeout",
+			func(o *sqlite.Options) { o.BusyPoll = optionsBusyTimeout + time.Nanosecond },
+			"dbkit: the option BusyPoll must be the BusyTimeout of 20.017s or less, got 20.017000001s"},
+		{"a missing busy poll and cache size", func(o *sqlite.Options) { o.BusyPoll, o.CacheSize = 0, 0 },
+			"dbkit: the option BusyPoll must be 1ms or more, got 0s"},
 		{"a missing cache size", func(o *sqlite.Options) { o.CacheSize = 0 },
 			"dbkit: the option CacheSize must stand above zero, got 0"},
 		{"a negative cache size", func(o *sqlite.Options) { o.CacheSize = -1 },
@@ -112,8 +128,11 @@ func TestOpenRefusesABadOption(t *testing.T) {
 
 			db, err := sqlite.Open(address, opts)
 
-			if err == nil || err.Error() != c.want || db != nil {
-				t.Errorf("Open() = %v, %v, want nil and %q", db, err, c.want)
+			if db != nil {
+				t.Errorf("Open() handle = %v, want nil", db)
+			}
+			if err == nil || err.Error() != c.want {
+				t.Errorf("Open() error = %v, want %q", err, c.want)
 			}
 			mustNotExist(t, path)
 		})
@@ -126,6 +145,7 @@ func TestOpenAcceptsTheSmallestValues(t *testing.T) {
 	address, _ := testAddress(t)
 	opts := testOptions()
 	opts.BusyTimeout = time.Millisecond
+	opts.BusyPoll = time.Millisecond
 	opts.CacheSize = 1
 	opts.MaxConns = 2
 	opts.Synchronous = sqlite.SynchronousFull
@@ -143,11 +163,21 @@ func TestOpenAcceptsTheSmallestValues(t *testing.T) {
 	}
 }
 
+func TestOpenAcceptsABusyPollEqualToTheBusyTimeout(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions()
+	opts.BusyPoll = opts.BusyTimeout
+
+	mustPing(t, rulesOpen(t, opts))
+}
+
 func TestOpenKeepsTheLargestValues(t *testing.T) {
 	t.Parallel()
 
 	opts := testOptions()
 	opts.BusyTimeout = optionsLargestBusyTimeout
+	opts.BusyPoll = optionsLargestBusyTimeout
 	opts.CacheSize = math.MaxInt32
 
 	busy, cache := rulesOpen(t, opts), rulesOpen(t, opts)

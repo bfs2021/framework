@@ -16,6 +16,7 @@ Releases of this module are tagged `dbkit/sqlite/vX.Y.Z`.
 
 ### Changed
 
+- **Breaking.** `Options.BusyPoll` is required, how often a waiting connection tries a lock again, from 1ms up to `BusyTimeout`. Set it from a setting of your own.
 - The module needs Go 1.27.2.
 - Requires `dbkit` 0.3.0.
 

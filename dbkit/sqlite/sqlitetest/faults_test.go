@@ -20,6 +20,8 @@ import (
 const (
 	// testBusyTimeout is a busy timeout no uncontended test waits out.
 	testBusyTimeout = 5 * time.Second
+	// testBusyPoll is the busy poll the tests pass, the smallest sqlite.Open accepts.
+	testBusyPoll = time.Millisecond
 	// testCacheSize is the page cache in kibibytes the tests pass.
 	testCacheSize = 1024
 	// testMaxConns is the connection cap the tests pass.
@@ -49,6 +51,7 @@ var errInjected = errors.New("sqlitetest test: the fault answered on purpose")
 func testOptions() sqlite.Options {
 	return sqlite.Options{
 		BusyTimeout: testBusyTimeout,
+		BusyPoll:    testBusyPoll,
 		CacheSize:   testCacheSize,
 		MaxConns:    testMaxConns,
 		Synchronous: sqlite.SynchronousNormal,
