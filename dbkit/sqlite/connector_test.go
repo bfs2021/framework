@@ -3,6 +3,7 @@
 package sqlite_test
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -21,6 +22,14 @@ const (
 	connectorSkipped = "dbkit: PRAGMA optimize skipped on a new connection while the database is busy"
 	// connectorNewFiles is how many new files the test opens a full pool on at once.
 	connectorNewFiles = 100
+	// connectorHold is how long a writer holds a new file while a first open must wait for it.
+	connectorHold = 100 * time.Millisecond
+	// connectorDeadline is the deadline of a first open behind a writer that never lets go.
+	connectorDeadline = 100 * time.Millisecond
+	// connectorShortBusyTimeout is a busy timeout a first open waits out on purpose.
+	connectorShortBusyTimeout = 300 * time.Millisecond
+	// connectorShortBusyPoll is how often a first open that waits out connectorShortBusyTimeout tries again.
+	connectorShortBusyPoll = 5 * time.Millisecond
 )
 
 // connectorRecords is a log handler that sends every record it handles to a channel.
@@ -66,10 +75,11 @@ func connectorMustSkip(t *testing.T, records <-chan slog.Record, path string) {
 	select {
 	case r := <-records:
 		attrs := connectorAttrs(r)
-		cause, _ := attrs["error"].Any().(error)
-		busy := errors.Is(sqlite.Classify(cause), dbkit.ErrBusy)
-		if r.Message != connectorSkipped || attrs["path"].String() != path || !busy {
-			t.Errorf("note = %q %v, want %q with the path and the busy error", r.Message, attrs, connectorSkipped)
+		if r.Message != connectorSkipped || attrs["path"].String() != path {
+			t.Errorf("note = %q %v, want %q with the path", r.Message, attrs, connectorSkipped)
+		}
+		if cause, _ := attrs["error"].Any().(error); !errors.Is(sqlite.Classify(cause), dbkit.ErrBusy) {
+			t.Errorf("note error = %v, want the busy error", cause)
 		}
 	default:
 		t.Fatal("no note arrived, want the skipped optimize noted")
@@ -184,6 +194,134 @@ func TestTheFirstConnectionsOfANewFileOpenTogether(t *testing.T) {
 		if err := db.Close(); err != nil {
 			t.Fatalf("Close() error = %v, want nil", err)
 		}
+	}
+}
+
+// connectorTwoPoolsAtOnce takes a full pool on each of two handles of one new file at once and returns every error.
+func connectorTwoPoolsAtOnce(t *testing.T) error {
+	t.Helper()
+	address, _ := testAddress(t)
+	handles := []*sql.DB{mustOpen(t, address, testOptions()), mustOpen(t, address, testOptions())}
+	taken := make(chan error, len(handles))
+	for _, db := range handles {
+		go func() { taken <- connectorOpenAtOnce(t, db) }()
+	}
+	errs := []error{<-taken, <-taken}
+	for _, db := range handles {
+		errs = append(errs, db.Close())
+	}
+	return errors.Join(errs...)
+}
+
+func TestTwoHandlesOpenANewFileTogether(t *testing.T) {
+	t.Parallel()
+
+	failed := 0
+	var first error
+	for range connectorNewFiles {
+		if err := connectorTwoPoolsAtOnce(t); err != nil {
+			failed++
+			first = cmp.Or(first, err)
+		}
+	}
+
+	if failed != 0 {
+		t.Errorf("%d of %d new files failed two full pools opened at once, the first with %v, want none",
+			failed, connectorNewFiles, first)
+	}
+}
+
+// connectorHoldNewFile returns a handle on a new file and a plain driver connection that ran begin on that file.
+func connectorHoldNewFile(t *testing.T, opts sqlite.Options, begin string) (*sql.DB, *sql.Conn) {
+	t.Helper()
+	address, path := testAddress(t)
+	db := mustOpen(t, address, opts)
+	plain, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = plain.Close() })
+	holder, err := plain.Conn(t.Context())
+	if err != nil {
+		t.Fatalf("Conn() error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = holder.Close() })
+	if _, err := holder.ExecContext(t.Context(), begin); err != nil {
+		t.Fatalf("ExecContext(%q) error = %v, want nil", begin, err)
+	}
+	return db, holder
+}
+
+// connectorPing pings db in a goroutine and returns the channel that receives its error.
+func connectorPing(t *testing.T, db *sql.DB) <-chan error {
+	t.Helper()
+	pinged := make(chan error, 1)
+	go func() { pinged <- db.PingContext(t.Context()) }()
+	return pinged
+}
+
+func TestTheFirstOpenOfANewFileWaitsForTheWriter(t *testing.T) {
+	t.Parallel()
+
+	db, holder := connectorHoldNewFile(t, testOptions(), "BEGIN IMMEDIATE")
+	began := time.Now()
+	pinged := connectorPing(t, db)
+
+	select {
+	case err := <-pinged:
+		t.Fatalf("PingContext() = %v after %v while the writer holds the file, want it to wait", err,
+			time.Since(began))
+	case <-time.After(connectorHold):
+	}
+	if _, err := holder.ExecContext(t.Context(), "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK error = %v, want nil", err)
+	}
+
+	if err := <-pinged; err != nil {
+		t.Fatalf("PingContext() error = %v, want nil once the writer let go", err)
+	}
+	var mode string
+	if err := db.QueryRowContext(t.Context(), "PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
+		t.Errorf("PRAGMA journal_mode = %q, %v, want wal", mode, err)
+	}
+}
+
+func TestTheFirstOpenOfANewFileStopsAtTheBusyTimeout(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions()
+	opts.BusyTimeout, opts.BusyPoll = connectorShortBusyTimeout, connectorShortBusyPoll
+	db, _ := connectorHoldNewFile(t, opts, "BEGIN IMMEDIATE")
+	began := time.Now()
+
+	err := db.PingContext(t.Context())
+
+	waited := time.Since(began)
+	if !errors.Is(sqlite.Classify(err), dbkit.ErrBusy) {
+		t.Errorf("PingContext() error = %v, want busy while the writer holds the file", err)
+	}
+	if waited < connectorShortBusyTimeout {
+		t.Errorf("PingContext() answered after %v, want at least the busy timeout %v", waited, connectorShortBusyTimeout)
+	}
+}
+
+func TestTheFirstOpenEndsWithItsContextBehindAnExclusiveLock(t *testing.T) {
+	t.Parallel()
+
+	db, _ := connectorHoldNewFile(t, testOptions(), "BEGIN EXCLUSIVE")
+	ctx, cancel := context.WithTimeout(t.Context(), connectorDeadline)
+	defer cancel()
+	began := time.Now()
+
+	err := db.PingContext(ctx)
+
+	waited := time.Since(began)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("PingContext() error = %v, want one matching context.DeadlineExceeded", err)
+	}
+	if waited > optionsBusyTimeout/10 {
+		t.Errorf("PingContext() answered after %v, want within a tenth of the busy timeout %v", waited,
+			optionsBusyTimeout)
 	}
 }
 

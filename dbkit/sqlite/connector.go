@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	modernc "modernc.org/sqlite"
 
@@ -39,6 +40,10 @@ type connector struct {
 	path string
 	// restore sets a connection's busy timeout back to the option.
 	restore string
+	// busyTimeout is how long a busy open keeps trying.
+	busyTimeout time.Duration
+	// busyPoll is how often a busy open tries again.
+	busyPoll time.Duration
 	// logger receives the skipped optimize notes.
 	logger *slog.Logger
 }
@@ -50,23 +55,23 @@ func newConnector(drv *modernc.Driver, path string, opts Options) *connector {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &connector{
-		driver:  drv,
-		open:    drv.Open,
-		name:    connectionString(path, opts),
-		path:    path,
-		restore: "PRAGMA busy_timeout=" + strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10),
-		logger:  logger,
+		driver:      drv,
+		open:        drv.Open,
+		name:        connectionString(path, opts),
+		path:        path,
+		restore:     "PRAGMA busy_timeout=" + strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10),
+		busyTimeout: opts.BusyTimeout,
+		busyPoll:    opts.BusyPoll,
+		logger:      logger,
 	}
 }
 
-// Connect opens one connection to the file, one open at a time, optimizes it and passes it through the path's seam.
+// Connect opens one connection, waiting while the open answers busy, optimizes it and passes it through the seam.
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	c.opening.Lock()
-	conn, err := c.open(c.name)
-	c.opening.Unlock()
+	conn, err := c.openWaiting(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +79,38 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		return nil, errors.Join(err, conn.Close())
 	}
 	return seam.Wrap(c.path, conn), nil
+}
+
+// openWaiting opens one connection, trying again every busy poll while busy, until the busy timeout passes or ctx ends.
+func (c *connector) openWaiting(ctx context.Context) (driver.Conn, error) {
+	deadline := time.NewTimer(c.busyTimeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(c.busyPoll)
+	defer poll.Stop()
+	for {
+		conn, err := c.openOnce()
+		if err == nil {
+			return conn, nil
+		}
+		if !errors.Is(Classify(err), dbkit.ErrBusy) {
+			return nil, err
+		}
+		poll.Reset(c.busyPoll)
+		select {
+		case <-ctx.Done():
+			return nil, ended(ctx, err)
+		case <-deadline.C:
+			return nil, err
+		case <-poll.C:
+		}
+	}
+}
+
+// openOnce opens one connection while it holds the opening mutex.
+func (c *connector) openOnce() (driver.Conn, error) {
+	c.opening.Lock()
+	defer c.opening.Unlock()
+	return c.open(c.name)
 }
 
 // Driver returns the private driver value of the handle.

@@ -20,6 +20,10 @@ Releases of this module are tagged `dbkit/sqlite/vX.Y.Z`.
 - The module needs Go 1.27.2.
 - Requires `dbkit` 0.3.0.
 
+### Fixed
+
+- A first connection to a file that another process is switching to WAL waits up to `BusyTimeout` instead of failing busy at once.
+
 ## [0.1.0] - 2026-10-08
 
 ### Added

@@ -78,7 +78,7 @@ func Open(address string, opts Options) (*sql.DB, error) {
 func connectionString(path string, opts Options) string {
 	name := fmt.Sprintf("%s?_txlock=immediate&_defensive=1&_busy_timeout=%d&_journal_mode=WAL&_foreign_keys=1"+
 		"&_synchronous=%s&_time_integer_format=unix_micro&_pragma=temp_store(MEMORY)&_pragma=cache_size(-%d)",
-		path, opts.BusyTimeout.Milliseconds(), opts.Synchronous.pragma(), opts.CacheSize)
+		path, opts.BusyPoll.Milliseconds(), opts.Synchronous.pragma(), opts.CacheSize)
 	if opts.JournalSizeLimit != nil {
 		name += fmt.Sprintf("&_pragma=journal_size_limit(%d)", *opts.JournalSizeLimit)
 	}
@@ -187,11 +187,15 @@ func checkPlace(path string) error {
 		}
 		return checkFolder(resolved)
 	}
-	if info, linkErr := os.Lstat(path); errors.Is(err, fs.ErrNotExist) && linkErr == nil &&
-		info.Mode()&fs.ModeSymlink != 0 {
+	if errors.Is(err, fs.ErrNotExist) && isLink(os.Lstat(path)) {
 		return fmt.Errorf("dbkit: the database path %s is a link to a missing file", path)
 	}
 	return checkFolder(filepath.Dir(path))
+}
+
+// isLink reports whether info, which os.Lstat answered with lstatErr, describes a symbolic link.
+func isLink(info fs.FileInfo, lstatErr error) bool {
+	return lstatErr == nil && info.Mode()&fs.ModeSymlink != 0
 }
 
 // checkFile returns the error for a database file that is missing without create, or that cannot be read.
