@@ -7,6 +7,10 @@ from CI.
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: `messages` keeps only the calls naming the given `domain`, and so does `pot` for the calls it reads from `sources`. A call naming no domain belongs to `default`, and a call whose domain is not a string literal is kept. Go markers and templates are read as before. An app whose catalogue loads under the default domain builds its template with `domain: 'default'`.
+
 ### Fixed
 
 - `untranslated` reports plural messages missing forms required by the catalogue's
