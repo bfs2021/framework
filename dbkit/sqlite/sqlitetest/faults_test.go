@@ -164,6 +164,103 @@ func TestFaultFailsTheChosenCommit(t *testing.T) {
 	mustCount(t, db, 1)
 }
 
+func TestFaultFailsTheChosenRollback(t *testing.T) {
+	t.Parallel()
+
+	faults := &sqlitetest.Faults{}
+	db := faultOpen(t, faults)
+	faults.FailNextRollback(errInjected)
+	tx := mustBegin(t, db)
+	mustExec(t, tx, faultInsert)
+
+	err := tx.Rollback()
+
+	if !errors.Is(err, errInjected) {
+		t.Errorf("Rollback() error = %v, want the injected error", err)
+	}
+	mustCount(t, db, 0)
+	next := mustBegin(t, db)
+	mustExec(t, next, "INSERT INTO fault_rows VALUES (2)")
+	if err := next.Rollback(); err != nil {
+		t.Errorf("the next Rollback() error = %v, want nil once the fault answered", err)
+	}
+	mustCount(t, db, 0)
+}
+
+func TestFaultKeepsTheDriversRollbackError(t *testing.T) {
+	t.Parallel()
+
+	faults := &sqlitetest.Faults{}
+	db := faultOpen(t, faults)
+	tx := mustBegin(t, db)
+	mustExec(t, tx, faultInsert)
+	mustExec(t, tx, "ROLLBACK")
+	faults.FailNextRollback(errInjected)
+
+	err := tx.Rollback()
+
+	if !errors.Is(err, errInjected) {
+		t.Errorf("Rollback() error = %v, want the injected error", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "no transaction is active") {
+		t.Errorf("Rollback() error = %v, want the driver's own error beside the injected one", err)
+	}
+	mustCount(t, db, 0)
+	next := mustBegin(t, db)
+	mustExec(t, next, "ROLLBACK")
+	if err := next.Rollback(); err == nil || !strings.Contains(err.Error(), "no transaction is active") {
+		t.Errorf("the next Rollback() error = %v, want the driver's own error with no fault set", err)
+	}
+}
+
+func TestFaultKeepsTheRollbackFailureThroughACommit(t *testing.T) {
+	t.Parallel()
+
+	faults := &sqlitetest.Faults{}
+	db := faultOpen(t, faults)
+	faults.FailNextRollback(errInjected)
+	tx := mustBegin(t, db)
+	mustExec(t, tx, faultInsert)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v, want nil", err)
+	}
+
+	err := mustBegin(t, db).Rollback()
+
+	if !errors.Is(err, errInjected) {
+		t.Errorf("the later Rollback() error = %v, want the injected error still armed", err)
+	}
+	mustCount(t, db, 1)
+}
+
+func TestFaultKeepsTheRollbackFailureThroughAFailedCommit(t *testing.T) {
+	t.Parallel()
+
+	errRollback := errors.New("sqlitetest test: the rollback fault answered on purpose")
+	faults := &sqlitetest.Faults{}
+	db := faultOpen(t, faults)
+	faults.FailNextCommit(errInjected)
+	faults.FailNextRollback(errRollback)
+	tx := mustBegin(t, db)
+	mustExec(t, tx, faultInsert)
+
+	err := tx.Commit()
+
+	if !errors.Is(err, errInjected) || errors.Is(err, errRollback) {
+		t.Errorf("Commit() error = %v, want the commit failure alone", err)
+	}
+	mustCount(t, db, 0)
+	if err := mustBegin(t, db).Rollback(); !errors.Is(err, errRollback) {
+		t.Errorf("the later Rollback() error = %v, want the rollback failure still armed", err)
+	}
+	failed := mustBegin(t, db)
+	mustExec(t, failed, "ROLLBACK")
+	faults.FailNextCommit(errInjected)
+	if err := failed.Commit(); !errors.Is(err, errInjected) || !strings.Contains(err.Error(), "no transaction is active") {
+		t.Errorf("a second failed Commit() error = %v, want the injected error beside the driver's rollback error", err)
+	}
+}
+
 func TestFaultFailsTheChosenStatementInsideATransaction(t *testing.T) {
 	t.Parallel()
 
@@ -719,23 +816,55 @@ func faultRace(ctx context.Context, db *sql.DB, faults *sqlitetest.Faults, own s
 	return nil
 }
 
-func TestFaultsServeEveryConnectionAtOnce(t *testing.T) {
-	t.Parallel()
+// rollbackRace arms a rollback failure on faults and rolls a read-only transaction back on db for faultRounds rounds.
+func rollbackRace(ctx context.Context, db *sql.DB, faults *sqlitetest.Faults, start <-chan struct{}) error {
+	<-start
+	for range faultRounds {
+		faults.FailNextRollback(errInjected)
+		tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return fmt.Errorf("BeginTx() error = %w, want nil", err)
+		}
+		if err := tx.Rollback(); err != nil && !errors.Is(err, errInjected) {
+			return fmt.Errorf("Rollback() error = %w, want nil or the injected error", err)
+		}
+	}
+	return nil
+}
 
-	faults := &sqlitetest.Faults{}
-	db := faultOpen(t, faults)
+// atOnce runs race on testMaxConns goroutines that start together and fails the test on each error.
+func atOnce(t *testing.T, race func(start <-chan struct{}, i int) error) {
+	t.Helper()
 	start, done := make(chan struct{}), make(chan error, testMaxConns)
 	for i := range testMaxConns {
-		go func() { done <- faultRace(t.Context(), db, faults, fmt.Sprintf("SELECT %d", i), start) }()
+		go func() { done <- race(start, i) }()
 	}
-
 	close(start)
-
 	for range testMaxConns {
 		if err := <-done; err != nil {
 			t.Error(err)
 		}
 	}
+}
+
+func TestFaultsServeEveryRollbackAtOnce(t *testing.T) {
+	t.Parallel()
+
+	faults := &sqlitetest.Faults{}
+	db := faultOpen(t, faults)
+
+	atOnce(t, func(start <-chan struct{}, _ int) error { return rollbackRace(t.Context(), db, faults, start) })
+}
+
+func TestFaultsServeEveryConnectionAtOnce(t *testing.T) {
+	t.Parallel()
+
+	faults := &sqlitetest.Faults{}
+	db := faultOpen(t, faults)
+
+	atOnce(t, func(start <-chan struct{}, i int) error {
+		return faultRace(t.Context(), db, faults, fmt.Sprintf("SELECT %d", i), start)
+	})
 }
 
 func TestABusyBeginKeepsItsErrorThroughTheWrapper(t *testing.T) {

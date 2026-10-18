@@ -10,9 +10,14 @@ Releases of this module are tagged `dbkit/sqlite/vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- `Faults.FailNextRollback`, which makes the next rollback answer the chosen error once and still end its transaction.
+
 ### Changed
 
 - The module needs Go 1.27.2.
+- Requires `dbkit` 0.3.0.
 
 ## [0.1.0] - 2026-10-08
 
