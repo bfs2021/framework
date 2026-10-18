@@ -9,6 +9,7 @@ import {
 	compileCatalog,
 	goMessages,
 	goString,
+	messages,
 	mismatched,
 	orphaned,
 	pot,
@@ -68,6 +69,103 @@ test('carries the domain it was given in its header', () => {
 
 	expect(held).toContain('X-Domain: probe')
 	expect(held).toContain('Project-Id-Version: probe')
+})
+
+test('leaves out a message another text domain names', () => {
+	const root = rootWith({ 'src/a.ts': "__('Own words', 'probe')\n__('Their words', 'other')\n" })
+
+	const held = pot({ domain: 'probe', root, sources: SOURCES }).toString()
+
+	expect(held).toContain('msgid "Own words"')
+	expect(held).not.toContain('Their words')
+})
+
+test('leaves out a message naming no text domain', () => {
+	const root = rootWith({ 'src/a.ts': "__('Own words', 'probe')\n__('Move up')\n" })
+
+	const held = pot({ domain: 'probe', root, sources: SOURCES }).toString()
+
+	expect(held).toContain('msgid "Own words"')
+	expect(held).not.toContain('Move up')
+})
+
+test('keeps the messages naming no text domain in a template for the default domain', () => {
+	const root = rootWith({ 'src/a.ts': "__('Own words', 'probe')\n__('Move up')\n" })
+
+	const held = pot({ domain: 'default', root, sources: SOURCES }).toString()
+
+	expect(held).toContain('msgid "Move up"')
+	expect(held).not.toContain('Own words')
+})
+
+test.each([
+	{
+		shape: '_x',
+		kept: 'Draft',
+		calls: ["_x('Draft', 'status', 'probe')", "_x('Pending', 'status', 'other')", "_x('Scheduled', 'probe')"],
+	},
+	{
+		shape: '_n',
+		kept: '%d post',
+		calls: [
+			"_n('%d post', '%d posts', 2, 'probe')",
+			"_n('%d page', '%d pages', 2, 'other')",
+			"_n('%d item', '%d items', 2)",
+		],
+	},
+	{
+		shape: '_nx',
+		kept: '%d draft',
+		calls: [
+			"_nx('%d draft', '%d drafts', 2, 'sidebar', 'probe')",
+			"_nx('%d note', '%d notes', 2, 'sidebar', 'other')",
+			"_nx('%d task', '%d tasks', 2, 'probe')",
+		],
+	},
+	{
+		shape: 'i18n.__',
+		kept: 'Own words',
+		calls: ["i18n.__('Own words', 'probe')", "i18n.__('Their words', 'other')", "i18n.__('Move up')"],
+	},
+])('reads the text domain where $shape names it', ({ kept, calls }) => {
+	const root = rootWith({ 'src/a.ts': `${calls.join('\n')}\n` })
+
+	const texts = messages({ domain: 'probe', root, sources: SOURCES }).map((found) => found.text)
+
+	expect(texts).toEqual([kept])
+})
+
+test('answers only the messages the given text domain names', () => {
+	const root = rootWith({ 'src/a.ts': "__('Own words', 'probe')\n__('Move up')\n__('Their words', 'other')\n" })
+
+	const texts = messages({ domain: 'probe', root, sources: SOURCES }).map((found) => found.text)
+
+	expect(texts).toEqual(['Own words'])
+})
+
+test('reads a text domain joined from string pieces', () => {
+	const root = rootWith({ 'src/a.ts': "__('Joined own', 'pro' + 'be')\n__('Joined other', 'oth' + 'er')\n" })
+
+	const held = pot({ domain: 'probe', root, sources: SOURCES }).toString()
+
+	expect(held).toContain('msgid "Joined own"')
+	expect(held).not.toContain('Joined other')
+})
+
+test('keeps a message whose text domain is not written as a string', () => {
+	const root = rootWith({ 'src/a.ts': "const DOMAIN = 'other'\n__('Kept words', DOMAIN)\n" })
+
+	const held = pot({ domain: 'probe', root, sources: SOURCES }).toString()
+
+	expect(held).toContain('msgid "Kept words"')
+})
+
+test('keeps a message its own domain names when another domain names it too', () => {
+	const root = rootWith({ 'src/a.ts': "__('Options')\n__('Options', 'probe')\n" })
+
+	const held = pot({ domain: 'probe', root, sources: SOURCES }).toString()
+
+	expect(held).toContain('msgid "Options"')
 })
 
 test('names its messages in a settled order however the sources are read', () => {

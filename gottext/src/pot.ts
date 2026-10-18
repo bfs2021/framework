@@ -20,6 +20,42 @@ const TEMPLATE_CALL = /\bT\.Get "((?:[^"\\]|\\.)*)"/g
 /** MARKER_CALL is the shape Go source marks a message with. */
 const MARKER_CALL = /\bMsgid\("((?:[^"\\]|\\.)*)"\)/g
 
+/** DEFAULT_DOMAIN is the text domain a call naming none belongs to. */
+const DEFAULT_DOMAIN = 'default'
+
+/** Extractor is what the parser runs over every piece of a source. */
+type Extractor = ReturnType<typeof JsExtractors.callExpression>
+
+/** Piece is one part of a parsed source the parser hands an extractor. */
+type Piece = Parameters<Extractor>[0]
+
+/** Parsed is the parsed source a piece sits in. */
+type Parsed = Parameters<Extractor>[1]
+
+/** Call is the part of a call the text domain check reads. */
+interface Call {
+	/** arguments are the values the call passes. */
+	arguments: ArrayLike<unknown>
+}
+
+/** Shape is one gettext call shape and where each of its arguments stands. */
+interface Shape {
+	/** callees are the names the call goes by. */
+	callees: string[]
+	/** positions are where the text, the plural and the context stand. */
+	positions: { text: number, textPlural?: number, context?: number }
+	/** domain is where the text domain stands. */
+	domain: number
+}
+
+/** SHAPES is the four gettext call shapes, placed as the WordPress packages place them. */
+const SHAPES: Shape[] = [
+	{ callees: ['__', 'i18n.__'], positions: { text: 0 }, domain: 1 },
+	{ callees: ['_x', 'i18n._x'], positions: { text: 0, context: 1 }, domain: 2 },
+	{ callees: ['_n', 'i18n._n'], positions: { text: 0, textPlural: 1 }, domain: 3 },
+	{ callees: ['_nx', 'i18n._nx'], positions: { text: 0, textPlural: 1, context: 3 }, domain: 4 },
+]
+
 /** Found is a message one of the four gettext calls declared. */
 export interface Found {
 	/** text is the message as the sources write it. */
@@ -32,7 +68,7 @@ export interface Found {
 
 /** PotOptions is what building a template needs. */
 export interface PotOptions {
-	/** domain is the text domain the template carries. */
+	/** domain is the text domain the template carries, and the only one whose calls it keeps from the sources. */
 	domain: string
 	/** root is the path the source globs resolve against. */
 	root: string
@@ -133,30 +169,55 @@ function byKey(left: GetTextTranslation, right: GetTextTranslation): number {
 }
 
 /**
- * Returns every translatable message the given sources declare.
- * @param options - Where to read the sources from.
+ * Returns the check telling whether a call of one shape names the given text domain.
+ * @param shape - The call shape to read.
+ * @param domain - The text domain the template is built for.
+ * @returns The check, which keeps a call whose text domain is not written as a string.
+ */
+function namesDomain(shape: Shape, domain: string): (call: Piece, file: Parsed, start: number) => boolean {
+	const named = JsExtractors.callExpression(shape.callees, {
+		arguments: { text: shape.domain },
+		comments: NO_COMMENTS,
+	})
+	return (call, file, start) => {
+		if ((call as unknown as Call).arguments.length <= shape.domain) {
+			return domain === DEFAULT_DOMAIN
+		}
+		const names: string[] = []
+		named(call, file, (found) => { names.push(found.text) }, start)
+		return names.length === 0 || names[0] === domain
+	}
+}
+
+/**
+ * Returns the extractor keeping the calls of one shape that name the given text domain.
+ * @param shape - The call shape to read.
+ * @param domain - The text domain the template is built for.
+ * @returns The extractor the parser runs over every piece of a source.
+ */
+function extractorFor(shape: Shape, domain: string): Extractor {
+	const message = JsExtractors.callExpression(shape.callees, {
+		arguments: shape.positions,
+		comments: NO_COMMENTS,
+	})
+	const keeps = namesDomain(shape, domain)
+	return (piece, file, add, start) => {
+		message(piece, file, (found) => {
+			if (keeps(piece, file, start)) {
+				add(found)
+			}
+		}, start)
+	}
+}
+
+/**
+ * Returns every translatable message the given sources declare under the given text domain.
+ * @param options - Where to read the sources from and the text domain to keep.
  * @returns The messages the extractor found.
  */
 export function messages(options: PotOptions): Found[] {
 	const extractor = new GettextExtractor()
-	const parser = extractor.createJsParser([
-		JsExtractors.callExpression(['__', 'i18n.__'], {
-			arguments: { text: 0 },
-			comments: NO_COMMENTS,
-		}),
-		JsExtractors.callExpression(['_x', 'i18n._x'], {
-			arguments: { text: 0, context: 1 },
-			comments: NO_COMMENTS,
-		}),
-		JsExtractors.callExpression(['_n', 'i18n._n'], {
-			arguments: { text: 0, textPlural: 1 },
-			comments: NO_COMMENTS,
-		}),
-		JsExtractors.callExpression(['_nx', 'i18n._nx'], {
-			arguments: { text: 0, textPlural: 1, context: 3 },
-			comments: NO_COMMENTS,
-		}),
-	])
+	const parser = extractor.createJsParser(SHAPES.map((shape) => extractorFor(shape, options.domain)))
 	for (const pattern of options.sources) {
 		parser.parseFilesGlob(pattern, {
 			cwd: options.root,
