@@ -33,7 +33,7 @@ func standing(cfg Config, name, summary, verb string, disabled bool) gonsole.Com
 	}
 }
 
-// setStanding sets whether the named account within reach is disabled, never leaving no privileged account enabled.
+// setStanding sets whether the named account within reach is disabled, never enabling one holding an undeclared role.
 func setStanding(ctx context.Context, call gonsole.Call, cfg Config, verb string, disabled bool) error {
 	email := address(call.Args[0])
 	roles, err := cfg.Roles(ctx, call)
@@ -48,12 +48,15 @@ func setStanding(ctx context.Context, call gonsole.Call, cfg Config, verb string
 		if err := within.sets(held, disabled); err != nil {
 			return err
 		}
+		if err := lost(roles, held, disabled); err != nil {
+			return err
+		}
 		if !call.Apply {
 			_, err := fmt.Fprintf(call.Stdout, "would %s %s\n", verb, held.Email)
 			return err
 		}
-		if err := store.SetUserDisabledUnderCover(ctx, held.ID, disabled, roles.Privileged); err != nil {
-			return uncovered(held.Email, err)
+		if err := store.SetUserDisabledFrom(ctx, held.ID, held.Role, disabled, roles.Privileged); err != nil {
+			return written(held.Email, err)
 		}
 		_, err = fmt.Fprintf(call.Stdout, "%sd %s\n", verb, held.Email)
 		return err

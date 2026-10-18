@@ -64,6 +64,22 @@ func (r reach) sets(held gouncer.User, disabled bool) error {
 	return r.changes(held)
 }
 
+// reenabling is what an account holding an undeclared role awaits before it may be enabled.
+const reenabling = "give it a declared role before enabling it"
+
+// lost refuses enabling an account whose stored role roles does not declare, an empty role included.
+func lost(roles Roles, held gouncer.User, disabled bool) error {
+	switch {
+	case disabled:
+		return nil
+	case held.Role == "":
+		return fmt.Errorf("the account %s holds no role, %s", held.Email, reenabling)
+	case !slices.Contains(roles.Known, held.Role):
+		return fmt.Errorf("the account %s holds the undeclared role %s, %s", held.Email, held.Role, reenabling)
+	}
+	return nil
+}
+
 // lacking returns the error naming the first capability of role the acting account's role lacks, nil for none.
 func (r reach) lacking(subject, role string) error {
 	for _, capability := range r.carried[role] {
