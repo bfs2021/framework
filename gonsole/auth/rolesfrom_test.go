@@ -28,6 +28,17 @@ func (r registry) CapabilitiesOf(role string) []string {
 	return slices.Clone(r[role])
 }
 
+// HoldersOf returns every role the table holds that carries capability, sorted.
+func (r registry) HoldersOf(capability string) []string {
+	var holders []string
+	for _, role := range r.Roles() {
+		if slices.Contains(r[role], capability) {
+			holders = append(holders, role)
+		}
+	}
+	return holders
+}
+
 // capableRegistry holds the table of capable, with author declared carrying nothing.
 var capableRegistry = registry{
 	"admin":  capable.Capabilities["admin"],
