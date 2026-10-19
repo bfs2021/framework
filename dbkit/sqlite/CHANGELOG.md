@@ -25,7 +25,7 @@ Releases of this module are tagged `dbkit/sqlite/vX.Y.Z`.
 ### Fixed
 
 - A statement, transaction or snapshot checkpoint waiting for a lock stops once its context ends, a prepared statement's run within one `BusyPoll`, and a `BeginTx` error then also matches the context error.
-- A first connection to a file that another process is switching to WAL waits up to `BusyTimeout` instead of failing busy at once.
+- A first connection to a file that another process is switching to WAL tries again every `BusyPoll` until `BusyTimeout` passes or its context ends, instead of failing busy at once.
 
 ## [0.1.0] - 2026-10-08
 
