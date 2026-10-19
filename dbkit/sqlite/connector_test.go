@@ -322,10 +322,9 @@ func TestTheFirstOpenOfANewFileStopsAtTheBusyTimeout(t *testing.T) {
 	}
 }
 
-func TestTheFirstOpenEndsWithItsContextBehindAnExclusiveLock(t *testing.T) {
-	t.Parallel()
-
-	db, _ := connectorHoldNewFile(t, testOptions(), "BEGIN EXCLUSIVE")
+// connectorMustEndAtItsDeadline fails unless a ping ends at its deadline, busy if wantBusy, then opens after holder.
+func connectorMustEndAtItsDeadline(t *testing.T, db *sql.DB, holder *sql.Conn, wantBusy bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), connectorDeadline)
 	defer cancel()
 	began := time.Now()
@@ -336,10 +335,37 @@ func TestTheFirstOpenEndsWithItsContextBehindAnExclusiveLock(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("PingContext() error = %v, want one matching context.DeadlineExceeded", err)
 	}
+	if busy := errors.Is(sqlite.Classify(err), dbkit.ErrBusy); busy != wantBusy {
+		t.Errorf("PingContext() error = %v, busy %v, want busy %v", err, busy, wantBusy)
+	}
 	if waited > optionsBusyTimeout/10 {
 		t.Errorf("PingContext() answered after %v, want within a tenth of the busy timeout %v", waited,
 			optionsBusyTimeout)
 	}
+	if _, err := holder.ExecContext(t.Context(), "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK error = %v, want nil", err)
+	}
+	if err := db.PingContext(t.Context()); err != nil {
+		t.Errorf("PingContext() error = %v once the holder let go, want nil", err)
+	}
+}
+
+func TestTheFirstOpenEndsWithItsContextBehindAnExclusiveLock(t *testing.T) {
+	t.Parallel()
+
+	db, holder := connectorHoldNewFile(t, testOptions(), "BEGIN EXCLUSIVE")
+
+	connectorMustEndAtItsDeadline(t, db, holder, true)
+}
+
+func TestTheFirstOpenEndsWithItsContextAtTheLongestBusyPoll(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions()
+	opts.BusyPoll = opts.BusyTimeout
+	db, holder := connectorHoldNewFile(t, opts, "BEGIN EXCLUSIVE")
+
+	connectorMustEndAtItsDeadline(t, db, holder, false)
 }
 
 // connectorWrapped is a connection the test's wrapper returned.

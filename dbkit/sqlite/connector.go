@@ -6,8 +6,8 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	modernc "modernc.org/sqlite"
@@ -31,8 +31,8 @@ type connector struct {
 	driver *modernc.Driver
 	// open opens one connection by the driver's name of the file.
 	open func(name string) (driver.Conn, error)
-	// opening lets one call of open run at a time.
-	opening sync.Mutex
+	// opening is the one slot a try of open holds until it answers, so one try runs at a time.
+	opening chan struct{}
 	// name is the driver's name of the file with every rule.
 	name string
 	// path is the absolute path of the file.
@@ -56,6 +56,7 @@ func newConnector(drv *modernc.Driver, path string, opts Options) *connector {
 	c := &connector{
 		driver:      drv,
 		open:        drv.Open,
+		opening:     make(chan struct{}, 1),
 		name:        connectionString(path, opts),
 		path:        path,
 		busyTimeout: opts.BusyTimeout,
@@ -91,30 +92,93 @@ func (c *connector) openWaiting(ctx context.Context) (driver.Conn, error) {
 	defer deadline.Stop()
 	poll := time.NewTicker(c.busyPoll)
 	defer poll.Stop()
+	var busy error
 	for {
-		conn, err := c.openOnce()
-		if err == nil {
-			return conn, nil
+		got, answered := c.openOnce(ctx)
+		if !answered {
+			return nil, gaveUp(ctx, busy)
 		}
-		if !errors.Is(Classify(err), dbkit.ErrBusy) {
-			return nil, err
+		if got.err == nil {
+			return got.conn, nil
 		}
+		if !errors.Is(Classify(got.err), dbkit.ErrBusy) {
+			return nil, got.err
+		}
+		busy = got.err
 		poll.Reset(c.busyPoll)
 		select {
 		case <-ctx.Done():
-			return nil, ended(ctx, err)
+			return nil, ended(ctx, busy)
 		case <-deadline.C:
-			return nil, err
+			return nil, busy
 		case <-poll.C:
 		}
 	}
 }
 
-// openOnce opens one connection while it holds the opening mutex.
-func (c *connector) openOnce() (driver.Conn, error) {
-	c.opening.Lock()
-	defer c.opening.Unlock()
-	return c.open(c.name)
+// openAnswer is what one try of open answered.
+type openAnswer struct {
+	// conn is the connection the try opened, nil after an error.
+	conn driver.Conn
+	// err is the error of the try.
+	err error
+}
+
+// openOnce runs one try of open in the opening slot and reports false when ctx ended before the try answered.
+func (c *connector) openOnce(ctx context.Context) (openAnswer, bool) {
+	if !c.takeSlot(ctx) {
+		return openAnswer{}, false
+	}
+	answer := make(chan openAnswer, 1)
+	go c.try(answer)
+	select {
+	case got := <-answer:
+		<-c.opening
+		return got, true
+	case <-ctx.Done():
+		go c.leave(answer)
+		return openAnswer{}, false
+	}
+}
+
+// takeSlot takes the opening slot at once when it is free, or waits for it, and reports false when ctx ended first.
+func (c *connector) takeSlot(ctx context.Context) bool {
+	select {
+	case c.opening <- struct{}{}:
+		return true
+	default:
+	}
+	select {
+	case c.opening <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// try sends on answer what one call of open answers.
+func (c *connector) try(answer chan<- openAnswer) {
+	conn, err := c.open(c.name)
+	answer <- openAnswer{conn: conn, err: err}
+}
+
+// leave closes the connection a given-up try opened once it answers on answer, then frees the opening slot.
+func (c *connector) leave(answer <-chan openAnswer) {
+	if got := <-answer; got.err == nil {
+		_ = got.conn.Close()
+	}
+	<-c.opening
+}
+
+// gaveUp returns the error of an open whose context ended before its try answered, marking the last busy error if any.
+func gaveUp(ctx context.Context, busy error) error {
+	if busy != nil {
+		return ended(ctx, busy)
+	}
+	if cause := context.Cause(ctx); !errors.Is(cause, ctx.Err()) {
+		return fmt.Errorf("dbkit: open the database: %w: %w", cause, ctx.Err())
+	}
+	return fmt.Errorf("dbkit: open the database: %w", ctx.Err())
 }
 
 // Driver returns the private driver value of the handle.

@@ -46,6 +46,10 @@ const (
 	internalCallers = 8
 	// internalCallsEach is how many times each of internalCallers calls Connect.
 	internalCallsEach = 50
+	// internalOpenEnded starts the error of an open whose context ended before any try answered busy.
+	internalOpenEnded = "dbkit: open the database: "
+	// internalFreeTakes is how many times a test takes the free opening slot under an ended context.
+	internalFreeTakes = 64
 )
 
 var (
@@ -53,6 +57,8 @@ var (
 	errStepFailed = errors.New("connector test: the statement failed on purpose")
 	// errCloseFailed is the error the fake connection's Close answers with.
 	errCloseFailed = errors.New("connector test: the close failed on purpose")
+	// errEndCause is the cause a test ends a context with.
+	errEndCause = errors.New("connector test: the context ended with this cause on purpose")
 )
 
 // internalOptions returns options with every required value set and Create on.
@@ -187,7 +193,25 @@ type internalCall struct {
 // internalStart runs Connect on c in a goroutine, which the end of the test cancels and waits for.
 func internalStart(t *testing.T, c *connector) *internalCall {
 	t.Helper()
-	ctx, cancel := context.WithCancel(t.Context())
+	return internalStartUnder(t, c, context.WithCancel)
+}
+
+// internalShortDeadline returns ctx with a deadline after internalShortBusyTimeout.
+func internalShortDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, internalShortBusyTimeout)
+}
+
+// internalCauseOf returns ctx with a cancel that ends it with errEndCause as its cause.
+func internalCauseOf(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	return ctx, func() { cancel(errEndCause) }
+}
+
+// internalStartUnder runs Connect on c in a goroutine under the context end makes, which the end of the test cancels.
+func internalStartUnder(t *testing.T, c *connector,
+	end func(context.Context) (context.Context, context.CancelFunc)) *internalCall {
+	t.Helper()
+	ctx, cancel := end(t.Context())
 	call := &internalCall{cancel: cancel, ended: make(chan struct{})}
 	go func() {
 		defer close(call.ended)
@@ -226,13 +250,88 @@ func (c *internalCall) mustWait(t *testing.T) {
 	}
 }
 
-// internalMustReceive fails the test when ch receives nothing within internalAtOnce.
-func internalMustReceive(t *testing.T, ch <-chan struct{}) {
+// internalMustReceive fails the test when ch receives nothing within internalAtOnce, naming the signal it wants.
+func internalMustReceive(t *testing.T, ch <-chan struct{}, want string) {
 	t.Helper()
 	select {
 	case <-ch:
 	case <-time.After(internalAtOnce):
-		t.Fatalf("no signal after %v, want the open to signal its call", internalAtOnce)
+		t.Fatalf("no signal after %v, want %s", internalAtOnce, want)
+	}
+}
+
+// internalClosing is a connection that reports its Close on a channel.
+type internalClosing struct {
+	*internalConn
+	// closed is closed once Close ran.
+	closed chan struct{}
+}
+
+// Close closes the channel closed.
+func (c *internalClosing) Close() error {
+	close(c.closed)
+	return nil
+}
+
+// internalHeld is an open whose every call waits until the test releases it.
+type internalHeld struct {
+	// conn is what the first call answers once released.
+	conn driver.Conn
+	// err is the error the first call answers once released.
+	err error
+	// started receives once the first call began.
+	started chan struct{}
+	// released is closed once the test lets every call answer.
+	released chan struct{}
+	// release closes released once.
+	release func()
+	// calls counts the calls that began.
+	calls atomic.Int32
+}
+
+// internalHold returns a held open whose first call answers conn and err, which the end of the test releases.
+func internalHold(t *testing.T, conn driver.Conn, err error) *internalHeld {
+	t.Helper()
+	released := make(chan struct{})
+	h := &internalHeld{conn: conn, err: err, started: make(chan struct{}, 1), released: released,
+		release: sync.OnceFunc(func() { close(released) })}
+	t.Cleanup(h.release)
+	return h
+}
+
+// open counts its call, signals the first one and answers once released, a fresh connection after the first call.
+func (h *internalHeld) open(string) (driver.Conn, error) {
+	if h.calls.Add(1) != 1 {
+		<-h.released
+		return &internalConn{}, nil
+	}
+	h.started <- struct{}{}
+	<-h.released
+	return h.conn, h.err
+}
+
+// internalGiveUp starts Connect on c, cancels it once the first try of held began and returns its error.
+func internalGiveUp(t *testing.T, c *connector, held *internalHeld) error {
+	t.Helper()
+	call := internalStart(t, c)
+	internalMustReceive(t, held.started, "the first try to begin")
+	call.cancel()
+	conn, err := call.within(t)
+	if conn != nil || !errors.Is(err, context.Canceled) {
+		t.Errorf("Connect() cancelled during its try = %v, %v, want nil and context.Canceled at once", conn, err)
+	}
+	return err
+}
+
+// internalMustOpenAgain fails the test unless a new Connect on c opens through the second call of held.
+func internalMustOpenAgain(t *testing.T, c *connector, held *internalHeld) {
+	t.Helper()
+	conn, err := internalStart(t, c).within(t)
+	if err != nil || conn == nil {
+		t.Errorf("Connect() after the given-up try = %v, %v, want a connection", conn, err)
+	}
+	if got := held.calls.Load(); got != 2 {
+		t.Errorf("opens = %d after the given-up try, want the second open to answer the new Connect", got)
 	}
 }
 
@@ -245,11 +344,12 @@ func TestConnectRefusesAnEndedContext(t *testing.T) {
 
 	conn, err := c.Connect(ctx)
 
-	if !errors.Is(err, context.Canceled) || conn != nil {
-		t.Errorf("Connect() = %v, %v, want nil and context.Canceled", conn, err)
+	if err != context.Canceled || conn != nil {
+		t.Errorf("Connect() = %v, %v, want nil and context.Canceled itself", conn, err)
 	}
+	c.opening <- struct{}{}
 	if *opened != 0 {
-		t.Errorf("opens = %d, want no open", *opened)
+		t.Errorf("opens = %d once the opening slot is free, want no open", *opened)
 	}
 }
 
@@ -336,7 +436,7 @@ func TestABusyOpenEndsWithItsContext(t *testing.T) {
 	}
 }
 
-func TestAWaitingOpenLeavesTheMutexFree(t *testing.T) {
+func TestAWaitingOpenLeavesTheSlotFree(t *testing.T) {
 	t.Parallel()
 
 	busy, fake := internalBusyError(t), &internalConn{}
@@ -350,7 +450,7 @@ func TestAWaitingOpenLeavesTheMutexFree(t *testing.T) {
 		return fake, nil
 	})
 	first := internalStart(t, c)
-	internalMustReceive(t, waiting)
+	internalMustReceive(t, waiting, "the open to signal its call")
 
 	conn, err := internalStart(t, c).within(t)
 
@@ -512,7 +612,7 @@ func TestASlowBusyOpenStopsAfterTheTryAtTheBusyTimeout(t *testing.T) {
 	}
 }
 
-func TestASlowBusyOpenStopsAfterTheTryItsContextEnded(t *testing.T) {
+func TestASlowBusyOpenStopsDuringTheTryItsContextEnded(t *testing.T) {
 	t.Parallel()
 
 	busy := internalBusyError(t)
@@ -559,4 +659,174 @@ func TestAHandleRunsOneOpenAtATime(t *testing.T) {
 	if overlapped.Load() {
 		t.Error("two opens of one handle ran at once, want one at a time")
 	}
+}
+
+func TestAnOpenEndsWithItsContextWhileItsTryRuns(t *testing.T) {
+	t.Parallel()
+
+	fake := &internalClosing{internalConn: &internalConn{}, closed: make(chan struct{})}
+	held := internalHold(t, fake, nil)
+	c := internalWaiting(internalUnreachedWait, internalUnreachedWait, held.open)
+
+	err := internalGiveUp(t, c, held)
+
+	if want := internalOpenEnded + context.Canceled.Error(); err == nil || err.Error() != want {
+		t.Errorf("Connect() error = %v, want %q", err, want)
+	}
+	held.release()
+	internalMustReceive(t, fake.closed, "the given-up try's connection closed")
+	internalMustOpenAgain(t, c, held)
+}
+
+func TestAnOpenWaitingForTheSlotEndsWithItsOwnContext(t *testing.T) {
+	t.Parallel()
+
+	held := internalHold(t, &internalConn{}, nil)
+	c := internalWaiting(internalUnreachedWait, internalUnreachedWait, held.open)
+	_ = internalGiveUp(t, c, held)
+
+	conn, err := internalStartUnder(t, c, internalShortDeadline).within(t)
+
+	if conn != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the second Connect() = %v, %v, want nil and context.DeadlineExceeded", conn, err)
+	}
+	if want := internalOpenEnded + context.DeadlineExceeded.Error(); err == nil || err.Error() != want {
+		t.Errorf("the second Connect() error = %v, want %q", err, want)
+	}
+	if got := held.calls.Load(); got != 1 {
+		t.Errorf("opens = %d, want the given-up try alone while it runs", got)
+	}
+}
+
+func TestOpensEndingDuringOneTryLeaveOnlyThatTryRunning(t *testing.T) {
+	t.Parallel()
+
+	held := internalHold(t, &internalConn{}, nil)
+	c := internalWaiting(internalUnreachedWait, internalUnreachedWait, held.open)
+	_ = internalGiveUp(t, c, held)
+	calls := make([]*internalCall, internalCallers)
+	for i := range calls {
+		calls[i] = internalStartUnder(t, c, internalShortDeadline)
+	}
+
+	for i, call := range calls {
+		if _, err := call.within(t); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Connect() %d error = %v, want context.DeadlineExceeded", i, err)
+		}
+	}
+
+	if got := held.calls.Load(); got != 1 {
+		t.Errorf("opens = %d after %d Connects ended, want the given-up try alone", got, internalCallers)
+	}
+	held.release()
+	internalMustOpenAgain(t, c, held)
+}
+
+func TestATryThatAnswersBusyAfterItsContextEndedLeavesNothingOpen(t *testing.T) {
+	t.Parallel()
+
+	held := internalHold(t, nil, internalBusyError(t))
+	c := internalWaiting(internalUnreachedWait, internalUnreachedWait, held.open)
+
+	err := internalGiveUp(t, c, held)
+
+	if errors.Is(Classify(err), dbkit.ErrBusy) {
+		t.Errorf("Connect() error = %v, want the context's alone, since no try answered busy before it ended", err)
+	}
+	held.release()
+	internalMustOpenAgain(t, c, held)
+}
+
+func TestAnOpenEndingDuringItsFirstTryMatchesTheContextCause(t *testing.T) {
+	t.Parallel()
+
+	held := internalHold(t, &internalConn{}, nil)
+	c := internalWaiting(internalUnreachedWait, internalUnreachedWait, held.open)
+	call := internalStartUnder(t, c, internalCauseOf)
+	internalMustReceive(t, held.started, "the first try to begin")
+
+	call.cancel()
+
+	conn, err := call.within(t)
+	if conn != nil || !errors.Is(err, errEndCause) {
+		t.Errorf("Connect() = %v, %v, want nil and an error matching the context's cause %q", conn, err, errEndCause)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Connect() error = %v, want it to match context.Canceled as the busy shape does", err)
+	}
+}
+
+func TestAnOpenEndingDuringALaterTryMarksTheLastBusyError(t *testing.T) {
+	t.Parallel()
+
+	busy := internalBusyError(t)
+	held := internalHold(t, &internalConn{}, nil)
+	var opened atomic.Int32
+	c := internalWaiting(internalUnreachedWait, internalBusyPoll, func(name string) (driver.Conn, error) {
+		if opened.Add(1) == 1 {
+			return nil, busy
+		}
+		return held.open(name)
+	})
+
+	err := internalGiveUp(t, c, held)
+
+	if want := busy.Error() + ": " + context.Canceled.Error(); !errors.Is(err, busy) || err.Error() != want {
+		t.Errorf("Connect() error = %v, want %q, the last busy error marked with the context's", err, want)
+	}
+}
+
+func TestAFreeSlotIsTakenEvenAfterTheContextEnded(t *testing.T) {
+	t.Parallel()
+
+	c, _ := internalConnector(&internalConn{}, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for take := range internalFreeTakes {
+		if !c.takeSlot(ctx) {
+			t.Fatalf("takeSlot() %d under an ended context = false, want the free slot taken at once", take)
+		}
+		<-c.opening
+	}
+}
+
+// internalSlowClose is a connection whose Close waits until the test lets it finish.
+type internalSlowClose struct {
+	// internalConn gives the connection the methods of driver.Conn and ExecContext.
+	*internalConn
+	// closing receives once Close began.
+	closing chan struct{}
+	// finished is closed once the test lets Close return.
+	finished chan struct{}
+}
+
+// Close signals closing and returns once finished is closed.
+func (c *internalSlowClose) Close() error {
+	c.closing <- struct{}{}
+	<-c.finished
+	return nil
+}
+
+func TestAGivenUpTryFreesTheSlotOnlyOnceItsConnectionClosed(t *testing.T) {
+	t.Parallel()
+
+	finished := make(chan struct{})
+	finish := sync.OnceFunc(func() { close(finished) })
+	t.Cleanup(finish)
+	fake := &internalSlowClose{internalConn: &internalConn{}, closing: make(chan struct{}, 1), finished: finished}
+	held := internalHold(t, fake, nil)
+	c := internalWaiting(internalUnreachedWait, internalUnreachedWait, held.open)
+	_ = internalGiveUp(t, c, held)
+	held.release()
+	internalMustReceive(t, fake.closing, "the given-up try's connection to start closing")
+
+	conn, err := internalStartUnder(t, c, internalShortDeadline).within(t)
+
+	if conn != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Connect() while the given-up connection closes = %v, %v, want nil and context.DeadlineExceeded",
+			conn, err)
+	}
+	finish()
+	internalMustOpenAgain(t, c, held)
 }
