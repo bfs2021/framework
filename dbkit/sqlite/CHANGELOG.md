@@ -16,7 +16,7 @@ Releases of this module are tagged `dbkit/sqlite/vX.Y.Z`.
 
 ### Changed
 
-- **Breaking.** `Options.BusyPoll` is required, how often a waiting connection tries a lock again, from 1ms up to `BusyTimeout`. Set it from a setting of your own.
+- **Breaking.** `Options.BusyPoll` is required, how often a waiting connection tries a lock again, from 1ms up to `BusyTimeout`. Set it from a setting of your own. Keep it small, because each opening try can block for about one `BusyPoll`.
 - Each connection waits for a lock through dbkit's own busy handler, so `PRAGMA busy_timeout` reads 0, and setting that pragma brings back a wait that ignores the context.
 - `sql.Conn.Raw` hands out a dbkit wrapper, so the driver's methods outside `database/sql`'s interfaces, such as `Serialize`, `NewBackup` and the hooks, are no longer reachable through it.
 - The module needs Go 1.27.2.
@@ -24,7 +24,7 @@ Releases of this module are tagged `dbkit/sqlite/vX.Y.Z`.
 
 ### Fixed
 
-- A statement, transaction or snapshot checkpoint waiting for a lock stops once its context ends, a prepared statement's run within one `BusyPoll`, and a `BeginTx` error then also matches the context error.
+- A statement, transaction or snapshot checkpoint waiting for a lock stops once its context ends. A prepared statement's run stops within one `BusyPoll` of its context ending. A `BeginTx` error after its context ends also matches the context error.
 - A first connection to a file that another process is switching to WAL tries again every `BusyPoll` until `BusyTimeout` passes or its context ends, instead of failing busy at once.
 
 ## [0.1.0] - 2026-10-08
