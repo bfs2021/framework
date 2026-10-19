@@ -3,6 +3,7 @@
 package sqlite
 
 import (
+	"cmp"
 	"context"
 	"database/sql/driver"
 	"errors"
@@ -25,6 +26,14 @@ const (
 	internalUpstreamMethod = "RegisterBusyHandler"
 	// internalKnownMethod is a method of the driver connection the lookup must find.
 	internalKnownMethod = "Ping"
+	// internalTypeName is the database type name the typed rows answer.
+	internalTypeName = "DECIMAL"
+	// internalLength is the column length the typed rows answer.
+	internalLength = 20
+	// internalPrecision is the precision the typed rows answer.
+	internalPrecision = 10
+	// internalScale is the scale the typed rows answer.
+	internalScale = 2
 )
 
 func TestEndedMarksAnErrorOnlyOnceItsContextEnded(t *testing.T) {
@@ -452,7 +461,7 @@ type internalRowsConn struct {
 	// driverConn is left nil.
 	driverConn
 	// rows is the result set every query answers.
-	rows *internalRows
+	rows driver.Rows
 }
 
 // QueryContext answers the rows of the connection.
@@ -498,6 +507,239 @@ func TestAQueryUnderALiveContextAnswersItsRows(t *testing.T) {
 	}
 }
 
+// internalTypedRows is a result set with no rows that answers each column type question with a value of its own.
+type internalTypedRows struct {
+	// internalRows gives the rows Columns, Next and a recorded Close.
+	internalRows
+}
+
+// ColumnTypeDatabaseTypeName answers internalTypeName.
+func (*internalTypedRows) ColumnTypeDatabaseTypeName(int) string {
+	return internalTypeName
+}
+
+// ColumnTypeLength answers internalLength.
+func (*internalTypedRows) ColumnTypeLength(int) (int64, bool) {
+	return internalLength, true
+}
+
+// ColumnTypeNullable answers that the column holds no NULL.
+func (*internalTypedRows) ColumnTypeNullable(int) (bool, bool) {
+	return false, true
+}
+
+// ColumnTypePrecisionScale answers internalPrecision and internalScale.
+func (*internalTypedRows) ColumnTypePrecisionScale(int) (int64, int64, bool) {
+	return internalPrecision, internalScale, true
+}
+
+// ColumnTypeScanType answers the type of a bool.
+func (*internalTypedRows) ColumnTypeScanType(int) reflect.Type {
+	return reflect.TypeFor[bool]()
+}
+
+// internalTypedQuery returns a wrapper on wait whose driver answers typed to every query.
+func internalTypedQuery(wait *busyWait, typed *internalTypedRows) *busyConn {
+	return &busyConn{driverConn: &internalRowsConn{rows: typed}, wait: wait}
+}
+
+// internalSpanDone returns the Done channel the span of wait holds, nil when it holds no span.
+func internalSpanDone(wait *busyWait) <-chan struct{} {
+	if s := wait.span.Load(); s != nil {
+		return s.done
+	}
+	return nil
+}
+
+func TestTheRowsOfAQueryKeepItsSpanUntilTheyClose(t *testing.T) {
+	t.Parallel()
+
+	wait, typed := &busyWait{}, &internalTypedRows{}
+	ctx := t.Context()
+
+	rows, err := internalTypedQuery(wait, typed).QueryContext(ctx, internalOptimize, nil)
+
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v, want nil", err)
+	}
+	if done := internalSpanDone(wait); done != ctx.Done() {
+		t.Errorf("the span while the rows are open holds %v, want the Done channel of the query's context", done)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close() error = %v, want nil", err)
+	}
+	if s := wait.span.Load(); s != nil {
+		t.Errorf("the span after Close = %+v, want none", s)
+	}
+	if !typed.closed {
+		t.Errorf("closed = %v, want the driver's rows closed", typed.closed)
+	}
+}
+
+func TestClosingRowsTwiceLeavesTheSpanOfALaterQuery(t *testing.T) {
+	t.Parallel()
+
+	wait := &busyWait{}
+	conn := internalTypedQuery(wait, &internalTypedRows{})
+	later, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first, err := conn.QueryContext(t.Context(), internalOptimize, nil)
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v, want nil", err)
+	}
+	second, err := conn.QueryContext(later, internalOptimize, nil)
+	if err != nil {
+		t.Fatalf("QueryContext() under the later context error = %v, want nil", err)
+	}
+
+	closed, again := first.Close(), first.Close()
+
+	if err := errors.Join(closed, again); err != nil {
+		t.Fatalf("Close() twice error = %v, want nil", err)
+	}
+	if done := internalSpanDone(wait); done != later.Done() {
+		t.Errorf("the span after the first rows closed twice holds %v, want the Done channel of the later query", done)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Close() of the later rows error = %v, want nil", err)
+	}
+	if s := wait.span.Load(); s != nil {
+		t.Errorf("the span after the later rows closed = %+v, want none", s)
+	}
+}
+
+func TestAQueryAnsweringNoWrappedRowsEndsItsSpan(t *testing.T) {
+	t.Parallel()
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	cases := []struct {
+		// name names the query.
+		name string
+		// ctx is the context of the query.
+		ctx context.Context
+		// driverConn is the driver connection that answers the query.
+		driverConn driverConn
+	}{
+		{"a query the driver failed", t.Context(), &internalBusyConn{busy: errStepFailed}},
+		{"a query whose context ended", cancelled, &internalRowsConn{rows: &internalTypedRows{}}},
+		{"rows lacking a column type interface", t.Context(), &internalRowsConn{rows: &internalRows{}}},
+	}
+	for _, c := range cases {
+		wait := &busyWait{}
+
+		rows, _ := (&busyConn{driverConn: c.driverConn, wait: wait}).QueryContext(c.ctx, internalOptimize, nil)
+
+		if s := wait.span.Load(); s != nil {
+			t.Errorf("the span after %s = %+v, want none", c.name, s)
+		}
+		if rows != nil {
+			_ = rows.Close()
+		}
+	}
+}
+
+// internalSpanRows is typed rows whose Close records the Done channel the span of wait holds and fails.
+type internalSpanRows struct {
+	// internalTypedRows answers every column type question.
+	internalTypedRows
+	// wait is the wait whose span Close records.
+	wait *busyWait
+	// closedUnder is the Done channel the span held when Close ran.
+	closedUnder <-chan struct{}
+}
+
+// Close records the Done channel the span of wait holds and fails with errStepFailed.
+func (r *internalSpanRows) Close() error {
+	r.closedUnder = internalSpanDone(r.wait)
+	return errStepFailed
+}
+
+func TestTheDriversRowsCloseUnderTheSpanOfTheirQuery(t *testing.T) {
+	t.Parallel()
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	for _, ctx := range []context.Context{t.Context(), cancelled} {
+		wait := &busyWait{}
+		spanRows := &internalSpanRows{wait: wait}
+		conn := &busyConn{driverConn: &internalRowsConn{rows: spanRows}, wait: wait}
+
+		rows, err := conn.QueryContext(ctx, internalOptimize, nil)
+		if err == nil {
+			err = rows.Close()
+		}
+
+		if spanRows.closedUnder != ctx.Done() {
+			t.Errorf("the span when the driver's rows closed held %v, want the Done channel %v of their query",
+				spanRows.closedUnder, ctx.Done())
+		}
+		if want := cmp.Or(ctx.Err(), errStepFailed); err != want {
+			t.Errorf("QueryContext() then Close() error = %v, want %v as it is", err, want)
+		}
+		if s := wait.span.Load(); s != nil {
+			t.Errorf("the span after the driver's rows closed = %+v, want none", s)
+		}
+	}
+}
+
+// internalColumnProbes asks rows each column type question and reports whether they answer as internalTypedRows.
+var internalColumnProbes = []struct {
+	// name names the interface.
+	name string
+	// answers reports whether rows offer the interface and answer it as internalTypedRows.
+	answers func(rows driver.Rows) bool
+}{
+	{"driver.RowsColumnTypeDatabaseTypeName", func(rows driver.Rows) bool {
+		r, ok := rows.(driver.RowsColumnTypeDatabaseTypeName)
+		return ok && r.ColumnTypeDatabaseTypeName(0) == internalTypeName
+	}},
+	{"driver.RowsColumnTypeLength", func(rows driver.Rows) bool {
+		r, ok := rows.(driver.RowsColumnTypeLength)
+		if !ok {
+			return false
+		}
+		length, known := r.ColumnTypeLength(0)
+		return known && length == internalLength
+	}},
+	{"driver.RowsColumnTypeNullable", func(rows driver.Rows) bool {
+		r, ok := rows.(driver.RowsColumnTypeNullable)
+		if !ok {
+			return false
+		}
+		nullable, known := r.ColumnTypeNullable(0)
+		return known && !nullable
+	}},
+	{"driver.RowsColumnTypePrecisionScale", func(rows driver.Rows) bool {
+		r, ok := rows.(driver.RowsColumnTypePrecisionScale)
+		if !ok {
+			return false
+		}
+		precision, scale, known := r.ColumnTypePrecisionScale(0)
+		return known && precision == internalPrecision && scale == internalScale
+	}},
+	{"driver.RowsColumnTypeScanType", func(rows driver.Rows) bool {
+		r, ok := rows.(driver.RowsColumnTypeScanType)
+		return ok && r.ColumnTypeScanType(0) == reflect.TypeFor[bool]()
+	}},
+}
+
+func TestTheRowsOfAQueryKeepEveryColumnTypeInterface(t *testing.T) {
+	t.Parallel()
+
+	rows, err := internalTypedQuery(&busyWait{}, &internalTypedRows{}).QueryContext(t.Context(), internalOptimize, nil)
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v, want nil", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for _, p := range internalColumnProbes {
+		if !p.answers(rows) {
+			t.Errorf("%s on the rows of a query is missing or answers otherwise, want the driver's answer", p.name)
+		}
+	}
+}
+
 // internalDriverConn returns a connection the driver itself opened to a fresh file, closed when the test ends.
 func internalDriverConn(t *testing.T) driver.Conn {
 	t.Helper()
@@ -533,5 +775,25 @@ func TestTheDriverOffersNoBusyHandlerYet(t *testing.T) {
 	if internalOffers(raw, internalUpstreamMethod) {
 		t.Errorf("modernc.org/sqlite now offers %s on %T, so replace the busy handler bridge in busy.go with it",
 			internalUpstreamMethod, raw)
+	}
+}
+
+func TestTheDriversRowsOfferEveryInterfaceTheWrapperKeepsAndNoOther(t *testing.T) {
+	t.Parallel()
+
+	rows, err := internalDriverConn(t).(driver.QueryerContext).QueryContext(t.Context(), "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v, want nil", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	if _, ok := rows.(driverRows); !ok {
+		t.Errorf("the driver's rows %T lack an interface of driverRows, so every query answers them unwrapped", rows)
+	}
+	if _, ok := rows.(driver.RowsNextResultSet); ok {
+		t.Errorf("modernc.org/sqlite now offers driver.RowsNextResultSet on %T, so keep it in busyRows", rows)
+	}
+	if _, ok := rows.(driver.RowsColumnScanner); ok {
+		t.Errorf("modernc.org/sqlite now offers driver.RowsColumnScanner on %T, so keep it in busyRows", rows)
 	}
 }

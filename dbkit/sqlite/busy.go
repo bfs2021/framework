@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"io"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,7 @@ type busyWait struct {
 	poll time.Duration
 	// began is when the current wait outside a call began.
 	began time.Time
-	// span is the call of busyConn running on the connection, nil between calls.
+	// span is the call of busyConn running on the connection, or the query whose rows are open, nil between calls.
 	span atomic.Pointer[callSpan]
 }
 
@@ -155,10 +156,11 @@ type busyConn struct {
 	wait *busyWait
 }
 
-// during hands the Done channel of ctx to the busy handler for one call and returns what ends the span.
+// during hands ctx's Done channel to the busy handler for one call and returns what ends that span, never a later one.
 func (c *busyConn) during(ctx context.Context) func() {
-	c.wait.span.Store(&callSpan{done: ctx.Done()})
-	return func() { c.wait.span.Store(nil) }
+	s := &callSpan{done: ctx.Done()}
+	c.wait.span.Store(s)
+	return func() { c.wait.span.CompareAndSwap(s, nil) }
 }
 
 // BeginTx starts a transaction, and an error after ctx ended also matches the error of ctx.
@@ -181,18 +183,66 @@ func (c *busyConn) ExecContext(ctx context.Context, query string, args []driver.
 	return r, nil
 }
 
-// QueryContext runs a query, and answers the error of ctx alone once ctx has ended.
+// QueryContext runs a query whose waits end with ctx until its rows close, and answers ctx's error alone once it ended.
 func (c *busyConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	defer c.during(ctx)()
+	endSpan := c.during(ctx)
 	rows, err := c.driverConn.QueryContext(ctx, query, args)
 	if err != nil {
+		endSpan()
 		return nil, interrupted(ctx, err)
 	}
 	if end := ctx.Err(); end != nil {
 		_ = rows.Close()
+		endSpan()
 		return nil, end
 	}
-	return rows, nil
+	return keepSpan(ctx, rows, endSpan), nil
+}
+
+// driverRows is every interface the driver's rows offer to database/sql.
+type driverRows interface {
+	driver.Rows
+	driver.RowsColumnTypeDatabaseTypeName
+	driver.RowsColumnTypeLength
+	driver.RowsColumnTypeNullable
+	driver.RowsColumnTypePrecisionScale
+	driver.RowsColumnTypeScanType
+}
+
+// keepSpan returns rows that end the span at Close, or ends it and returns rows as they are if they lack an interface.
+func keepSpan(ctx context.Context, rows driver.Rows, endSpan func()) driver.Rows {
+	full, ok := rows.(driverRows)
+	if !ok {
+		endSpan()
+		return rows
+	}
+	return &busyRows{driverRows: full, ctx: ctx, endSpan: endSpan}
+}
+
+// busyRows is the driver's rows of a query whose waits end with the query's context until the rows close.
+type busyRows struct {
+	// driverRows is the driver's own rows.
+	driverRows
+	// ctx is the context of the query.
+	ctx context.Context
+	// endSpan ends the span of the query.
+	endSpan func()
+}
+
+// Next reads the next row, and answers the error of ctx alone when it failed after ctx ended.
+func (r *busyRows) Next(dest []driver.Value) error {
+	err := r.driverRows.Next(dest)
+	if err == nil || err == io.EOF {
+		return err
+	}
+	return interrupted(r.ctx, err)
+}
+
+// Close closes the rows and ends the span of their query.
+func (r *busyRows) Close() error {
+	err := r.driverRows.Close()
+	r.endSpan()
+	return err
 }
 
 // PrepareContext prepares a statement, and answers the error of ctx alone when it failed after ctx ended.

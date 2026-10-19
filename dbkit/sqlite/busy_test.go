@@ -6,6 +6,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -34,6 +37,22 @@ const (
 	busyWritten = "SELECT count(*) FROM busy_rows WHERE a = 1"
 	// busyLateSchema is the schema change that leaves a connection's cached schema stale.
 	busyLateSchema = "CREATE TABLE late_schema (a INTEGER)"
+	// busyAuxSchema creates the table of the file a connection attaches as aux.
+	busyAuxSchema = "CREATE TABLE aux_rows (a INTEGER)"
+	// busyAttach attaches the file named by its one argument as aux.
+	busyAttach = "ATTACH DATABASE ? AS aux"
+	// busyLaterStep answers one row on its first step and reads aux only on its second.
+	busyLaterStep = "SELECT 1 UNION ALL SELECT page_count FROM pragma_page_count('aux')"
+	// busyAuxRead reads aux, so a holder inside a transaction keeps its read lock.
+	busyAuxRead = "SELECT count(*) FROM aux_rows"
+	// busyAuxReturning writes one row to aux on its first step and commits it at the end of its rows.
+	busyAuxReturning = "INSERT INTO aux.aux_rows VALUES (1) RETURNING a"
+	// busyTypedSchema creates a table whose columns declare their types.
+	busyTypedSchema = "CREATE TABLE typed_rows (amount INTEGER NOT NULL, label VARCHAR(20) NOT NULL)"
+	// busyTypedInsert writes one row of synthetic values to the typed table.
+	busyTypedInsert = "INSERT INTO typed_rows VALUES (5, 'synthetic')"
+	// busyTypedRead reads every column of the typed table.
+	busyTypedRead = "SELECT amount, label FROM typed_rows"
 )
 
 // busyShape is one call that waits for the write lock.
@@ -370,5 +389,131 @@ func TestEveryConnectionEndsItsWaitAtItsDeadline(t *testing.T) {
 			t.Errorf("BeginTx() on connection %d answered after %v, want within a tenth of the busy timeout %v", i,
 				waited, optionsBusyTimeout)
 		}
+	}
+}
+
+// busyAttachHeld returns a connection of db with aux, a rollback journal file a plain handle locks by running hold.
+func busyAttachHeld(t *testing.T, db *sql.DB, hold ...string) *sql.Conn {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "aux.db")
+	plain, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = plain.Close() })
+	holder, pinned := busyPin(t, plain), busyPin(t, db)
+	busyPinExec(t, holder, busyAuxSchema)
+	if _, err := pinned.ExecContext(t.Context(), busyAttach, path); err != nil {
+		t.Fatalf("ExecContext(%q) error = %v, want nil", busyAttach, err)
+	}
+	for _, query := range hold {
+		busyPinExec(t, holder, query)
+	}
+	return pinned
+}
+
+func TestALaterStepOfAQueryEndsItsWaitWithItsContext(t *testing.T) {
+	t.Parallel()
+
+	pinned := busyAttachHeld(t, rulesOpen(t, busyOptions(busyPoll)), "BEGIN EXCLUSIVE")
+	ctx, cancel := context.WithTimeout(t.Context(), busyDeadline)
+	defer cancel()
+	began := time.Now()
+	rows, err := pinned.QueryContext(ctx, busyLaterStep)
+	if err != nil {
+		t.Fatalf("QueryContext(%q) error = %v, want its first row", busyLaterStep, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	first, second := rows.Next(), rows.Next()
+
+	waited := time.Since(began)
+	if !first || second {
+		t.Errorf("Next() = %v, then %v, want the first row and then no second while aux is held", first, second)
+	}
+	if err := rows.Err(); err != context.DeadlineExceeded {
+		t.Errorf("Err() = %v, want exactly the deadline once the second step stopped", err)
+	}
+	if waited > busyBound {
+		t.Errorf("the second step answered after %v, want within a tenth of the busy timeout %v", waited,
+			optionsBusyTimeout)
+	}
+}
+
+func TestClosingTheRowsOfAWriteEndsItsWaitWithItsContext(t *testing.T) {
+	t.Parallel()
+
+	pinned := busyAttachHeld(t, rulesOpen(t, busyOptions(busyPoll)), "BEGIN", busyAuxRead)
+	ctx, cancel := context.WithTimeout(t.Context(), busyDeadline)
+	defer cancel()
+	began := time.Now()
+	var a int64
+
+	err := pinned.QueryRowContext(ctx, busyAuxReturning).Scan(&a)
+
+	waited := time.Since(began)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(sqlite.Classify(err), dbkit.ErrBusy) {
+		t.Errorf("Scan() error = %v, want the deadline or busy once the commit at Close stopped", err)
+	}
+	if waited > busyBound {
+		t.Errorf("the commit at Close answered after %v, want within a tenth of the busy timeout %v", waited,
+			optionsBusyTimeout)
+	}
+}
+
+// busyColumn is what database/sql reports of one column.
+type busyColumn struct {
+	// name is the column's name.
+	name string
+	// typeName is the column's database type name.
+	typeName string
+	// scan names the column's scan type.
+	scan string
+	// length is the column's length.
+	length int64
+	// hasLength reports that the length is known.
+	hasLength bool
+	// nullable reports that the column may hold NULL.
+	nullable bool
+	// knowsNullable reports that nullable is known.
+	knowsNullable bool
+}
+
+// busyColumnOf returns what database/sql reports of the column c.
+func busyColumnOf(c *sql.ColumnType) busyColumn {
+	length, hasLength := c.Length()
+	nullable, knowsNullable := c.Nullable()
+	return busyColumn{name: c.Name(), typeName: c.DatabaseTypeName(), scan: c.ScanType().String(), length: length,
+		hasLength: hasLength, nullable: nullable, knowsNullable: knowsNullable}
+}
+
+func TestTheRowsOfAQueryKeepTheDriversColumnTypes(t *testing.T) {
+	t.Parallel()
+
+	db := rulesOpen(t, testOptions())
+	rulesExec(t, db, busyTypedSchema)
+	rulesExec(t, db, busyTypedInsert)
+	rows, err := db.QueryContext(t.Context(), busyTypedRead)
+	if err != nil {
+		t.Fatalf("QueryContext(%q) error = %v, want nil", busyTypedRead, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	types, err := rows.ColumnTypes()
+
+	if err != nil {
+		t.Fatalf("ColumnTypes() error = %v, want nil", err)
+	}
+	got := make([]busyColumn, len(types))
+	for i, c := range types {
+		got[i] = busyColumnOf(c)
+	}
+	want := []busyColumn{
+		{name: "amount", typeName: "INTEGER", scan: "int64", nullable: true, knowsNullable: true},
+		{name: "label", typeName: "VARCHAR(20)", scan: "string", length: math.MaxInt64, hasLength: true, nullable: true,
+			knowsNullable: true},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ColumnTypes() = %+v, want the driver's %+v", got, want)
 	}
 }
