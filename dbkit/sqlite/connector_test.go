@@ -25,7 +25,7 @@ const (
 	// connectorHold is how long a writer holds a new file while a first open must wait for it.
 	connectorHold = 100 * time.Millisecond
 	// connectorDeadline is the deadline of a first open behind a writer that never lets go.
-	connectorDeadline = 100 * time.Millisecond
+	connectorDeadline = 500 * time.Millisecond
 	// connectorWaitDeadline is the deadline of a new connection's wait behind a held writer.
 	connectorWaitDeadline = 100 * time.Millisecond
 	// connectorShortBusyTimeout is a busy timeout a first open waits out on purpose.
