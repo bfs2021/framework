@@ -51,9 +51,13 @@ func runRecorded(t *testing.T, helper func(testing.TB)) *recorder {
 	return r
 }
 
+// internalBusyPoll is the busy poll of internalOptions, the smallest sqlite.Open accepts.
+const internalBusyPoll = time.Millisecond
+
 // internalOptions returns options with every required value set.
 func internalOptions() sqlite.Options {
-	return sqlite.Options{BusyTimeout: 5 * time.Second, CacheSize: 1024, MaxConns: 2, Synchronous: sqlite.SynchronousFull}
+	return sqlite.Options{BusyTimeout: 5 * time.Second, BusyPoll: internalBusyPoll, CacheSize: 1024, MaxConns: 2,
+		Synchronous: sqlite.SynchronousFull}
 }
 
 // stubConn offers every interface of the driver's connection and runs nothing.

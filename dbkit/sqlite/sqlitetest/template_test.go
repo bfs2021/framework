@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -34,6 +35,8 @@ const (
 	templateLockWait = 5 * time.Second
 	// templateLockPoll is how often a run tries the migration lock.
 	templateLockPoll = 10 * time.Millisecond
+	// templateShortBusyTimeout is a busy timeout a test waits out on purpose.
+	templateShortBusyTimeout = 30 * time.Millisecond
 )
 
 // schemaMigration returns a migrate function that creates the template table and counts its runs in runs.
@@ -116,35 +119,44 @@ func TestATemplateCopyAnswersFaults(t *testing.T) {
 	}
 }
 
-func TestTemplateServesEveryTestItsOwnCopy(t *testing.T) {
-	t.Parallel()
+// templateWriteOwnCopy writes one row to a fresh copy of tp, checks the copy holds that row only and returns its path.
+func templateWriteOwnCopy(t *testing.T, tp *Template) string {
+	t.Helper()
+	db := tp.Open(t)
+	if _, err := db.ExecContext(t.Context(), templateInsert); err != nil {
+		t.Fatalf("ExecContext(%q) error = %v, want nil", templateInsert, err)
+	}
+	if got := templateRows(t, db); got != 1 {
+		t.Errorf("rows in the copy = %d, want 1, its own row only", got)
+	}
+	return databaseFile(t, db)
+}
 
-	var runs int
-	tp := mustTemplate(t, internalOptions(), schemaMigration(&runs))
+// templateCopiesOfEveryTest runs templateTests parallel tests that each write to a copy of tp and returns every path.
+func templateCopiesOfEveryTest(t *testing.T, tp *Template) []string {
+	t.Helper()
 	copies := make(chan string, templateTests)
-
 	t.Run("tests", func(t *testing.T) {
 		for i := range templateTests {
 			t.Run(strconv.Itoa(i), func(t *testing.T) {
 				t.Parallel()
-				db := tp.Open(t)
-				if _, err := db.ExecContext(t.Context(), templateInsert); err != nil {
-					t.Fatalf("ExecContext(%q) error = %v, want nil", templateInsert, err)
-				}
-				if got := templateRows(t, db); got != 1 {
-					t.Errorf("rows in the copy = %d, want 1, its own row only", got)
-				}
-				copies <- databaseFile(t, db)
+				copies <- templateWriteOwnCopy(t, tp)
 			})
 		}
 	})
 	close(copies)
-
-	if runs != 1 {
-		t.Errorf("migrate ran %d times, want once for every test", runs)
-	}
-	seen := map[string]bool{}
+	var paths []string
 	for path := range copies {
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// templateMustBeDistinct fails the test unless no path sits in the template folder of tp and no two paths are equal.
+func templateMustBeDistinct(t *testing.T, tp *Template, paths []string) {
+	t.Helper()
+	seen := map[string]bool{}
+	for _, path := range paths {
 		if filepath.Dir(path) == tp.folder {
 			t.Errorf("a test opened %s in the template folder, want a copy in its own folder", path)
 		}
@@ -153,6 +165,20 @@ func TestTemplateServesEveryTestItsOwnCopy(t *testing.T) {
 	if len(seen) != templateTests {
 		t.Errorf("the tests opened %d distinct files, want %d", len(seen), templateTests)
 	}
+}
+
+func TestTemplateServesEveryTestItsOwnCopy(t *testing.T) {
+	t.Parallel()
+
+	var runs int
+	tp := mustTemplate(t, internalOptions(), schemaMigration(&runs))
+
+	paths := templateCopiesOfEveryTest(t, tp)
+
+	if runs != 1 {
+		t.Errorf("migrate ran %d times, want once for every test", runs)
+	}
+	templateMustBeDistinct(t, tp, paths)
 	if got := templateRows(t, tp.Open(t)); got != 0 {
 		t.Errorf("rows in a copy made after every test wrote = %d, want 0 with the template untouched", got)
 	}
@@ -217,12 +243,42 @@ func templateRead[T any](t *testing.T, conn *sql.Conn, query string, args ...any
 // templateSynchronous maps each Synchronous option to the value PRAGMA synchronous reads back.
 var templateSynchronous = map[sqlite.Synchronous]int64{sqlite.SynchronousNormal: 1, sqlite.SynchronousFull: 2}
 
-// templateMustKeepTheRules fails the test unless connection i of a copy opened with opts carries every rule.
-func templateMustKeepTheRules(t *testing.T, i int, conn *sql.Conn, opts sqlite.Options) {
+// templateMustWaitBehind fails the test unless BeginTx on connection i of conns waits timeout behind the next one.
+func templateMustWaitBehind(t *testing.T, conns []*sql.Conn, i int, timeout time.Duration) {
+	t.Helper()
+	holder, err := conns[(i+1)%len(conns)].BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() on the connection after %d error = %v, want nil", i, err)
+	}
+	defer func() { _ = holder.Rollback() }()
+	began := time.Now()
+
+	tx, err := conns[i].BeginTx(t.Context(), nil)
+
+	waited := time.Since(began)
+	if err == nil {
+		_ = tx.Rollback()
+	}
+	if !errors.Is(sqlite.Classify(err), dbkit.ErrBusy) || waited < timeout {
+		t.Errorf("BeginTx() on connection %d behind a held writer = %v after %v, want busy after at least %v", i, err,
+			waited, timeout)
+	}
+}
+
+// templateMustKeepTheRules fails the test unless connection i of conns, from a copy opened with opts, keeps every rule.
+func templateMustKeepTheRules(t *testing.T, conns []*sql.Conn, i int, opts sqlite.Options) {
+	t.Helper()
+	templateMustReadTheRules(t, i, conns[i], opts)
+	templateMustRefuseASchemaEdit(t, i, conns[i])
+	templateMustWaitBehind(t, conns, i, opts.BusyTimeout)
+}
+
+// templateMustReadTheRules fails the test unless every pragma and function of connection i reads the rule of opts.
+func templateMustReadTheRules(t *testing.T, i int, conn *sql.Conn, opts sqlite.Options) {
 	t.Helper()
 	pragmas := map[string]int64{
 		"PRAGMA foreign_keys": 1,
-		"PRAGMA busy_timeout": opts.BusyTimeout.Milliseconds(),
+		"PRAGMA busy_timeout": 0,
 		"PRAGMA temp_store":   2,
 		"PRAGMA cache_size":   -int64(opts.CacheSize),
 		"PRAGMA synchronous":  templateSynchronous[opts.Synchronous],
@@ -242,6 +298,11 @@ func templateMustKeepTheRules(t *testing.T, i int, conn *sql.Conn, opts sqlite.O
 	if got := templateRead[string](t, conn, "SELECT casefold('ÑANDÚ')"); got != "ñandú" {
 		t.Errorf("casefold('ÑANDÚ') on connection %d = %q, want ñandú", i, got)
 	}
+}
+
+// templateMustRefuseASchemaEdit fails the test unless connection i refuses an edit of the schema table.
+func templateMustRefuseASchemaEdit(t *testing.T, i int, conn *sql.Conn) {
+	t.Helper()
 	if _, err := conn.ExecContext(t.Context(), "PRAGMA writable_schema=ON"); err != nil {
 		t.Fatalf("PRAGMA writable_schema=ON on connection %d error = %v, want nil", i, err)
 	}
@@ -260,13 +321,15 @@ func TestTemplateCopyKeepsEveryRule(t *testing.T) {
 	}
 	opts := internalOptions()
 	opts.Functions = functions
+	opts.BusyTimeout = templateShortBusyTimeout
 	var runs int
 	tp := mustTemplate(t, opts, schemaMigration(&runs))
 
 	db := tp.Open(t)
 
-	for i, conn := range templateConns(t, db, opts.MaxConns) {
-		templateMustKeepTheRules(t, i, conn, opts)
+	conns := templateConns(t, db, opts.MaxConns)
+	for i := range conns {
+		templateMustKeepTheRules(t, conns, i, opts)
 	}
 }
 
@@ -299,6 +362,17 @@ func templateLinkRoot(t *testing.T) string {
 	}
 	t.Setenv("TMPDIR", link)
 	return target
+}
+
+// mustRefuseTemplate fails the test unless NewTemplate answered no template and an error that reads want.
+func mustRefuseTemplate(t *testing.T, tp *Template, err error, want string) {
+	t.Helper()
+	if tp != nil {
+		t.Errorf("NewTemplate() template = %v, want nil", tp)
+	}
+	if got := fmt.Sprint(err); got != want {
+		t.Errorf("NewTemplate() error = %s, want %q", got, want)
+	}
 }
 
 // mustHoldNothing fails the test unless folder is empty.
@@ -334,9 +408,7 @@ func TestTemplateThatFailsLeavesNoFolderBehind(t *testing.T) {
 
 			tp, err := NewTemplate(t.Context(), c.opts, c.migrate)
 
-			if tp != nil || err == nil || err.Error() != c.want {
-				t.Errorf("NewTemplate() = %v, %v, want nil and %q", tp, err, c.want)
-			}
+			mustRefuseTemplate(t, tp, err, c.want)
 			mustHoldNothing(t, root)
 		})
 	}
@@ -428,9 +500,11 @@ func TestTemplateNeedsATempFolder(t *testing.T) {
 
 			tp, err := NewTemplate(t.Context(), internalOptions(), schemaMigration(&runs))
 
-			if tp != nil || !errors.Is(err, c.marked) || !strings.HasPrefix(err.Error(), c.want) {
-				t.Errorf("NewTemplate() = %v, %v, want nil and an error marked %v starting %q",
-					tp, err, c.marked, c.want)
+			if tp != nil {
+				t.Errorf("NewTemplate() template = %v, want nil", tp)
+			}
+			if !errors.Is(err, c.marked) || !strings.HasPrefix(err.Error(), c.want) {
+				t.Errorf("NewTemplate() error = %v, want an error marked %v starting %q", err, c.marked, c.want)
 			}
 		})
 	}
@@ -457,10 +531,7 @@ func TestTemplateRefusesANilMigrate(t *testing.T) {
 
 	tp, err := NewTemplate(t.Context(), internalOptions(), nil)
 
-	want := "dbkit: NewTemplate needs a migrate function, got nil"
-	if tp != nil || err == nil || err.Error() != want {
-		t.Errorf("NewTemplate() = %v, %v, want nil and %q", tp, err, want)
-	}
+	mustRefuseTemplate(t, tp, err, "dbkit: NewTemplate needs a migrate function, got nil")
 	mustHoldNothing(t, root)
 }
 
@@ -496,11 +567,8 @@ func TestTemplateRefusesAMigrateThatLeavesAConnectionOpen(t *testing.T) {
 		return err
 	})
 
-	want := "dbkit: the template keeps its write-ahead log " + file + "-wal after its handle closed, " +
-		"so migrate left a connection open"
-	if tp != nil || err == nil || err.Error() != want {
-		t.Errorf("NewTemplate() = %v, %v, want nil and %q", tp, err, want)
-	}
+	mustRefuseTemplate(t, tp, err, "dbkit: the template keeps its write-ahead log "+file+"-wal after its handle closed, "+
+		"so migrate left a connection open")
 	mustHoldNothing(t, root)
 }
 

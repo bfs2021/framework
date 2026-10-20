@@ -20,6 +20,8 @@ import (
 const (
 	// testBusyTimeout is a busy timeout no uncontended test waits out.
 	testBusyTimeout = 5 * time.Second
+	// testBusyPoll is the busy poll the tests pass, the smallest sqlite.Open accepts.
+	testBusyPoll = time.Millisecond
 	// testCacheSize is the page cache in kibibytes the tests pass.
 	testCacheSize = 1024
 	// testMaxConns is the connection cap the tests pass.
@@ -49,6 +51,7 @@ var errInjected = errors.New("sqlitetest test: the fault answered on purpose")
 func testOptions() sqlite.Options {
 	return sqlite.Options{
 		BusyTimeout: testBusyTimeout,
+		BusyPoll:    testBusyPoll,
 		CacheSize:   testCacheSize,
 		MaxConns:    testMaxConns,
 		Synchronous: sqlite.SynchronousNormal,
@@ -510,12 +513,35 @@ func mustRead[T any](t *testing.T, conn *sql.Conn, query string, args ...any) T 
 	return value
 }
 
-// mustKeepTheRules fails the test unless connection i of a handle from testOptions carries every rule.
-func mustKeepTheRules(t *testing.T, i int, conn *sql.Conn) {
+// mustWaitBehind fails the test unless BeginTx on connection i of conns waits testShortBusyTimeout behind the next one.
+func mustWaitBehind(t *testing.T, conns []*sql.Conn, i int) {
 	t.Helper()
+	holder, err := conns[(i+1)%len(conns)].BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() on the connection after %d error = %v, want nil", i, err)
+	}
+	defer func() { _ = holder.Rollback() }()
+	began := time.Now()
+
+	tx, err := conns[i].BeginTx(t.Context(), nil)
+
+	waited := time.Since(began)
+	if err == nil {
+		_ = tx.Rollback()
+	}
+	if !errors.Is(sqlite.Classify(err), dbkit.ErrBusy) || waited < testShortBusyTimeout {
+		t.Errorf("BeginTx() on connection %d behind a held writer = %v after %v, want busy after at least %v", i, err,
+			waited, testShortBusyTimeout)
+	}
+}
+
+// mustKeepTheRules fails the test unless connection i of conns, from testOptions, carries every rule.
+func mustKeepTheRules(t *testing.T, conns []*sql.Conn, i int) {
+	t.Helper()
+	conn := conns[i]
 	pragmas := map[string]int64{
 		"PRAGMA foreign_keys": 1,
-		"PRAGMA busy_timeout": testBusyTimeout.Milliseconds(),
+		"PRAGMA busy_timeout": 0,
 		"PRAGMA temp_store":   2,
 		"PRAGMA cache_size":   -testCacheSize,
 		"PRAGMA synchronous":  1,
@@ -537,6 +563,7 @@ func mustKeepTheRules(t *testing.T, i int, conn *sql.Conn) {
 	if err == nil || !strings.Contains(err.Error(), "may not be modified") {
 		t.Errorf("an edit of the schema table on connection %d error = %v, want it refused", i, err)
 	}
+	mustWaitBehind(t, conns, i)
 }
 
 // errMissing is what a probe answers when the raw connection lacks its interface.
@@ -900,13 +927,15 @@ func TestTheRulesStayOnThroughAWrappedConnection(t *testing.T) {
 	}
 	opts := testOptions()
 	opts.Functions = functions
+	opts.BusyTimeout = testShortBusyTimeout
 	faults := &sqlitetest.Faults{}
 	db := sqlitetest.OpenWithFaults(t, opts, faults)
 	mustExec(t, db, faultSchema)
 	faults.FailStatement(faultChosen, errInjected)
+	conns := mustTakeEvery(t, db)
 
-	for i, conn := range mustTakeEvery(t, db) {
-		mustKeepTheRules(t, i, conn)
+	for i, conn := range conns {
+		mustKeepTheRules(t, conns, i)
 		if got := mustRead[string](t, conn, "SELECT casefold('ÑANDÚ')"); got != "ñandú" {
 			t.Errorf("casefold('ÑANDÚ') on connection %d = %q, want ñandú", i, got)
 		}
