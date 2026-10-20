@@ -27,11 +27,11 @@ type busyWait struct {
 	poll time.Duration
 	// began is when the current wait outside a call began.
 	began time.Time
-	// span is the call of busyConn running on the connection, or the query whose rows are open, nil between calls.
+	// span is the driver call running on the connection, nil between calls.
 	span atomic.Pointer[callSpan]
 }
 
-// callSpan is one call of busyConn on a connection.
+// callSpan is one driver call on a connection.
 type callSpan struct {
 	// done is the Done channel of the call's context, nil for a context that never ends.
 	done <-chan struct{}
@@ -156,16 +156,15 @@ type busyConn struct {
 	wait *busyWait
 }
 
-// during hands ctx's Done channel to the busy handler for one call and returns what ends that span, never a later one.
-func (c *busyConn) during(ctx context.Context) func() {
-	s := &callSpan{done: ctx.Done()}
-	c.wait.span.Store(s)
-	return func() { c.wait.span.CompareAndSwap(s, nil) }
+// during hands ctx's Done channel to the busy handler for one call and returns what ends that span.
+func (w *busyWait) during(ctx context.Context) func() {
+	w.span.Store(&callSpan{done: ctx.Done()})
+	return func() { w.span.Store(nil) }
 }
 
 // BeginTx starts a transaction, and an error after ctx ended also matches the error of ctx.
 func (c *busyConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	defer c.during(ctx)()
+	defer c.wait.during(ctx)()
 	tx, err := c.driverConn.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, ended(ctx, err)
@@ -175,7 +174,7 @@ func (c *busyConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.T
 
 // ExecContext runs a statement, and answers the error of ctx alone when it failed after ctx ended.
 func (c *busyConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	defer c.during(ctx)()
+	defer c.wait.during(ctx)()
 	r, err := c.driverConn.ExecContext(ctx, query, args)
 	if err != nil {
 		return nil, interrupted(ctx, err)
@@ -183,20 +182,23 @@ func (c *busyConn) ExecContext(ctx context.Context, query string, args []driver.
 	return r, nil
 }
 
-// QueryContext runs a query whose waits end with ctx until its rows close, and answers ctx's error alone once it ended.
+// QueryContext runs a query whose every step waits under ctx, and answers ctx's error alone once it ended.
 func (c *busyConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	endSpan := c.during(ctx)
-	rows, err := c.driverConn.QueryContext(ctx, query, args)
+	return c.wait.query(ctx, func() (driver.Rows, error) { return c.driverConn.QueryContext(ctx, query, args) })
+}
+
+// query makes one query under a span of ctx, answers ctx's error alone once it ended, and wraps the rows it answers.
+func (w *busyWait) query(ctx context.Context, run func() (driver.Rows, error)) (driver.Rows, error) {
+	defer w.during(ctx)()
+	rows, err := run()
 	if err != nil {
-		endSpan()
 		return nil, interrupted(ctx, err)
 	}
 	if end := ctx.Err(); end != nil {
 		_ = rows.Close()
-		endSpan()
 		return nil, end
 	}
-	return keepSpan(ctx, rows, endSpan), nil
+	return w.wrapRows(ctx, rows), nil
 }
 
 // driverRows is every interface the driver's rows offer to database/sql.
@@ -209,28 +211,28 @@ type driverRows interface {
 	driver.RowsColumnTypeScanType
 }
 
-// keepSpan returns rows that end the span at Close, or ends it and returns rows as they are if they lack an interface.
-func keepSpan(ctx context.Context, rows driver.Rows, endSpan func()) driver.Rows {
+// wrapRows returns rows whose Next and Close wait under a span of ctx, or rows as they are if they lack an interface.
+func (w *busyWait) wrapRows(ctx context.Context, rows driver.Rows) driver.Rows {
 	full, ok := rows.(driverRows)
 	if !ok {
-		endSpan()
 		return rows
 	}
-	return &busyRows{driverRows: full, ctx: ctx, endSpan: endSpan}
+	return &busyRows{driverRows: full, ctx: ctx, wait: w}
 }
 
-// busyRows is the driver's rows of a query whose waits end with the query's context until the rows close.
+// busyRows is the driver's rows of a query whose every Next and Close waits under a span of the query's context.
 type busyRows struct {
 	// driverRows is the driver's own rows.
 	driverRows
 	// ctx is the context of the query.
 	ctx context.Context
-	// endSpan ends the span of the query.
-	endSpan func()
+	// wait is the wait of the connection that ran the query.
+	wait *busyWait
 }
 
-// Next reads the next row, and answers the error of ctx alone when it failed after ctx ended.
+// Next reads the next row under the query's context, and answers its error alone when the read failed after it ended.
 func (r *busyRows) Next(dest []driver.Value) error {
+	defer r.wait.during(r.ctx)()
 	err := r.driverRows.Next(dest)
 	if err == nil || err == io.EOF {
 		return err
@@ -238,26 +240,67 @@ func (r *busyRows) Next(dest []driver.Value) error {
 	return interrupted(r.ctx, err)
 }
 
-// Close closes the rows and ends the span of their query.
+// Close closes the rows under the query's context, and answers its error alone when the close failed after it ended.
 func (r *busyRows) Close() error {
-	err := r.driverRows.Close()
-	r.endSpan()
-	return err
+	defer r.wait.during(r.ctx)()
+	if err := r.driverRows.Close(); err != nil {
+		return interrupted(r.ctx, err)
+	}
+	return nil
 }
 
 // PrepareContext prepares a statement, and answers the error of ctx alone when it failed after ctx ended.
 func (c *busyConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	defer c.during(ctx)()
+	defer c.wait.during(ctx)()
 	stmt, err := c.driverConn.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, interrupted(ctx, err)
 	}
-	return stmt, nil
+	return c.wait.wrapStmt(stmt), nil
+}
+
+// driverStmt is every interface the driver's statement offers to database/sql.
+type driverStmt interface {
+	driver.Stmt
+	driver.StmtExecContext
+	driver.StmtQueryContext
+}
+
+// wrapStmt returns stmt whose every run waits under a span of its context, or stmt as it is if it lacks an interface.
+func (w *busyWait) wrapStmt(stmt driver.Stmt) driver.Stmt {
+	full, ok := stmt.(driverStmt)
+	if !ok {
+		return stmt
+	}
+	return &busyStmt{driverStmt: full, wait: w}
+}
+
+// busyStmt is a driver statement whose every run waits under a span of the run's context.
+type busyStmt struct {
+	// driverStmt is the driver's own statement.
+	driverStmt
+	// wait is the wait of the connection that prepared the statement.
+	wait *busyWait
+}
+
+// ExecContext runs the statement, and answers the error of ctx alone when it failed after ctx ended.
+func (s *busyStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	defer s.wait.during(ctx)()
+	r, err := s.driverStmt.ExecContext(ctx, args)
+	if err != nil {
+		return nil, interrupted(ctx, err)
+	}
+	return r, nil
+}
+
+// QueryContext runs the statement as a query whose steps wait under ctx, and answers ctx's error alone once it ended.
+func (s *busyStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.wait.query(ctx, func() (driver.Rows, error) { return s.driverStmt.QueryContext(ctx, args) })
 }
 
 // Ping checks the connection, and answers the error of ctx alone when it failed after ctx ended.
 func (c *busyConn) Ping(ctx context.Context) error {
-	defer c.during(ctx)()
+	defer c.wait.during(ctx)()
 	if err := c.driverConn.Ping(ctx); err != nil {
 		return interrupted(ctx, err)
 	}

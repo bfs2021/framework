@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"modernc.org/libc"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
@@ -273,75 +274,19 @@ func TestAWaitOutsideACallStartsFreshAtCountZero(t *testing.T) {
 	}
 }
 
-// internalSpanConn is a driver connection that records the Done channel the wait's span holds during each call.
-type internalSpanConn struct {
-	// driverConn is left nil.
-	driverConn
-	// wait is the wait whose span each call reads.
-	wait *busyWait
-	// seen maps each call to the Done channel of the span it ran in, nil for a call with no span.
-	seen map[string]<-chan struct{}
-}
-
-// record notes the Done channel of the span the call name runs in.
-func (c *internalSpanConn) record(name string) {
-	c.seen[name] = nil
-	if s := c.wait.span.Load(); s != nil {
-		c.seen[name] = s.done
-	}
-}
-
-// BeginTx records its span and starts no transaction.
-func (c *internalSpanConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
-	c.record("BeginTx")
-	return nil, errStepFailed
-}
-
-// ExecContext records its span and runs nothing.
-func (c *internalSpanConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
-	c.record("ExecContext")
-	return nil, errStepFailed
-}
-
-// QueryContext records its span and runs nothing.
-func (c *internalSpanConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
-	c.record("QueryContext")
-	return nil, errStepFailed
-}
-
-// PrepareContext records its span and prepares nothing.
-func (c *internalSpanConn) PrepareContext(context.Context, string) (driver.Stmt, error) {
-	c.record("PrepareContext")
-	return nil, errStepFailed
-}
-
-// Ping records its span.
-func (c *internalSpanConn) Ping(context.Context) error {
-	c.record("Ping")
-	return nil
-}
-
-func TestEveryCallHandsItsDoneChannelToTheWait(t *testing.T) {
+func TestAnInterruptedHandleAnswersBusyDuringACallWhoseContextIsLive(t *testing.T) {
 	t.Parallel()
 
-	wait := &busyWait{}
-	fake := &internalSpanConn{wait: wait, seen: map[string]<-chan struct{}{}}
-	conn := &busyConn{driverConn: fake, wait: wait}
-	ctx := t.Context()
+	conn := internalRealConn(t)
+	defer conn.wait.during(t.Context())()
+	tls := libc.NewTLS()
+	defer tls.Close()
+	sqlite3.Xsqlite3_interrupt(tls, conn.wait.db)
 
-	_, _ = conn.BeginTx(ctx, driver.TxOptions{})
-	_, _ = conn.ExecContext(ctx, internalOptimize, nil)
-	_, _ = conn.QueryContext(ctx, internalOptimize, nil)
-	_, _ = conn.PrepareContext(ctx, internalOptimize)
-	_ = conn.Ping(ctx)
+	got := internalHandler(conn.id, 0)
 
-	for _, name := range []string{"BeginTx", "ExecContext", "QueryContext", "PrepareContext", "Ping"} {
-		if done, ok := fake.seen[name]; !ok || done != ctx.Done() {
-			t.Errorf("the span during %s holds %v, want the Done channel of the call's context", name, done)
-		}
-	}
-	if s := wait.span.Load(); s != nil {
-		t.Errorf("the span after every call = %+v, want none between calls", s)
+	if got != 0 {
+		t.Errorf("busyHandler() at count 0 on an interrupted handle during a live call = %d, want 0 to answer busy", got)
 	}
 }
 
@@ -551,64 +496,84 @@ func internalSpanDone(wait *busyWait) <-chan struct{} {
 	return nil
 }
 
-func TestTheRowsOfAQueryKeepItsSpanUntilTheyClose(t *testing.T) {
+// internalSpanRows is typed rows whose Next and Close record the Done channel the span of wait holds.
+type internalSpanRows struct {
+	// internalTypedRows answers every column type question.
+	internalTypedRows
+	// wait is the wait whose span Next and Close record.
+	wait *busyWait
+	// nextUnder is the Done channel the span held when Next last ran.
+	nextUnder <-chan struct{}
+	// closedUnder is the Done channel the span held when Close ran.
+	closedUnder <-chan struct{}
+}
+
+// Next records the Done channel the span of wait holds and answers the end of the rows.
+func (r *internalSpanRows) Next([]driver.Value) error {
+	r.nextUnder = internalSpanDone(r.wait)
+	return io.EOF
+}
+
+// Close records the Done channel the span of wait holds and fails with errStepFailed.
+func (r *internalSpanRows) Close() error {
+	r.closedUnder = internalSpanDone(r.wait)
+	return errStepFailed
+}
+
+func TestTheRowsOfAQueryHoldItsSpanOnlyDuringNextAndClose(t *testing.T) {
 	t.Parallel()
 
-	wait, typed := &busyWait{}, &internalTypedRows{}
+	wait := &busyWait{}
+	spanRows := &internalSpanRows{wait: wait}
 	ctx := t.Context()
 
-	rows, err := internalTypedQuery(wait, typed).QueryContext(ctx, internalOptimize, nil)
-
+	rows, err := (&busyConn{driverConn: &internalRowsConn{rows: spanRows}, wait: wait}).QueryContext(ctx,
+		internalOptimize, nil)
 	if err != nil {
 		t.Fatalf("QueryContext() error = %v, want nil", err)
 	}
-	if done := internalSpanDone(wait); done != ctx.Done() {
-		t.Errorf("the span while the rows are open holds %v, want the Done channel of the query's context", done)
+	open := wait.span.Load()
+	next := rows.Next(nil)
+	between := wait.span.Load()
+	closed := rows.Close()
+
+	if open != nil || between != nil {
+		t.Errorf("the span while the rows are open between calls = %+v, then %+v, want none", open, between)
 	}
-	if err := rows.Close(); err != nil {
-		t.Fatalf("Close() error = %v, want nil", err)
+	internalMustReadUnder(t, "the query", spanRows, ctx)
+	if next != io.EOF || closed != errStepFailed {
+		t.Errorf("Next() then Close() error = %v, then %v, want the driver's %v, then %v", next, closed, io.EOF,
+			errStepFailed)
 	}
 	if s := wait.span.Load(); s != nil {
 		t.Errorf("the span after Close = %+v, want none", s)
 	}
-	if !typed.closed {
-		t.Errorf("closed = %v, want the driver's rows closed", typed.closed)
-	}
 }
 
-func TestClosingRowsTwiceLeavesTheSpanOfALaterQuery(t *testing.T) {
+func TestANextAfterAnotherCallStillWaitsUnderTheContextOfItsQuery(t *testing.T) {
 	t.Parallel()
 
 	wait := &busyWait{}
-	conn := internalTypedQuery(wait, &internalTypedRows{})
-	later, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	first, err := conn.QueryContext(t.Context(), internalOptimize, nil)
+	spanRows := &internalSpanRows{wait: wait}
+	queries := &busyConn{driverConn: &internalRowsConn{rows: spanRows}, wait: wait}
+	execs := &busyConn{driverConn: &internalBusyConn{busy: errStepFailed}, wait: wait}
+	ctxs := internalContexts(t, "the query", "the statement")
+	rows, err := queries.QueryContext(ctxs["the query"], internalOptimize, nil)
 	if err != nil {
 		t.Fatalf("QueryContext() error = %v, want nil", err)
 	}
-	second, err := conn.QueryContext(later, internalOptimize, nil)
-	if err != nil {
-		t.Fatalf("QueryContext() under the later context error = %v, want nil", err)
-	}
 
-	closed, again := first.Close(), first.Close()
+	_, _ = execs.ExecContext(ctxs["the statement"], internalOptimize, nil)
+	_ = rows.Next(nil)
+	_ = rows.Close()
 
-	if err := errors.Join(closed, again); err != nil {
-		t.Fatalf("Close() twice error = %v, want nil", err)
-	}
-	if done := internalSpanDone(wait); done != later.Done() {
-		t.Errorf("the span after the first rows closed twice holds %v, want the Done channel of the later query", done)
-	}
-	if err := second.Close(); err != nil {
-		t.Fatalf("Close() of the later rows error = %v, want nil", err)
-	}
+	internalMustReadUnder(t, "the query", spanRows, ctxs["the query"])
 	if s := wait.span.Load(); s != nil {
-		t.Errorf("the span after the later rows closed = %+v, want none", s)
+		t.Errorf("the span after Close = %+v, want none", s)
 	}
 }
 
-func TestAQueryAnsweringNoWrappedRowsEndsItsSpan(t *testing.T) {
+func TestEveryQueryEndsItsSpanBeforeItAnswers(t *testing.T) {
 	t.Parallel()
 
 	cancelled, cancel := context.WithCancel(t.Context())
@@ -624,6 +589,7 @@ func TestAQueryAnsweringNoWrappedRowsEndsItsSpan(t *testing.T) {
 		{"a query the driver failed", t.Context(), &internalBusyConn{busy: errStepFailed}},
 		{"a query whose context ended", cancelled, &internalRowsConn{rows: &internalTypedRows{}}},
 		{"rows lacking a column type interface", t.Context(), &internalRowsConn{rows: &internalRows{}}},
+		{"rows the wrapper keeps", t.Context(), &internalRowsConn{rows: &internalTypedRows{}}},
 	}
 	for _, c := range cases {
 		wait := &busyWait{}
@@ -637,22 +603,6 @@ func TestAQueryAnsweringNoWrappedRowsEndsItsSpan(t *testing.T) {
 			_ = rows.Close()
 		}
 	}
-}
-
-// internalSpanRows is typed rows whose Close records the Done channel the span of wait holds and fails.
-type internalSpanRows struct {
-	// internalTypedRows answers every column type question.
-	internalTypedRows
-	// wait is the wait whose span Close records.
-	wait *busyWait
-	// closedUnder is the Done channel the span held when Close ran.
-	closedUnder <-chan struct{}
-}
-
-// Close records the Done channel the span of wait holds and fails with errStepFailed.
-func (r *internalSpanRows) Close() error {
-	r.closedUnder = internalSpanDone(r.wait)
-	return errStepFailed
 }
 
 func TestTheDriversRowsCloseUnderTheSpanOfTheirQuery(t *testing.T) {
@@ -795,5 +745,31 @@ func TestTheDriversRowsOfferEveryInterfaceTheWrapperKeepsAndNoOther(t *testing.T
 	}
 	if _, ok := rows.(driver.RowsColumnScanner); ok {
 		t.Errorf("modernc.org/sqlite now offers driver.RowsColumnScanner on %T, so keep it in busyRows", rows)
+	}
+}
+
+// internalColumnConverter is the one method of driver.ColumnConverter.
+type internalColumnConverter interface {
+	// ColumnConverter returns the converter of the column at idx.
+	ColumnConverter(idx int) driver.ValueConverter
+}
+
+func TestTheDriversStatementOffersEveryInterfaceTheWrapperKeepsAndNoOther(t *testing.T) {
+	t.Parallel()
+
+	stmt, err := internalDriverConn(t).(driver.ConnPrepareContext).PrepareContext(t.Context(), "SELECT 1")
+	if err != nil {
+		t.Fatalf("PrepareContext() error = %v, want nil", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	if _, ok := stmt.(driverStmt); !ok {
+		t.Errorf("the driver's statement %T lacks an interface of driverStmt, so every prepare answers it unwrapped", stmt)
+	}
+	if _, ok := stmt.(driver.NamedValueChecker); ok {
+		t.Errorf("modernc.org/sqlite now offers driver.NamedValueChecker on %T, so keep it in busyStmt", stmt)
+	}
+	if _, ok := stmt.(internalColumnConverter); ok {
+		t.Errorf("modernc.org/sqlite now offers driver.ColumnConverter on %T, so keep it in busyStmt", stmt)
 	}
 }
