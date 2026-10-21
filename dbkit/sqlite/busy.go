@@ -191,7 +191,13 @@ type busyTx struct {
 // Commit commits the transaction, and a wait for a lock ends with the transaction's context.
 func (t *busyTx) Commit() error {
 	defer t.wait.during(t.ctx)()
-	return ended(t.ctx, t.Tx.Commit())
+	err := t.Tx.Commit()
+	if err == nil {
+		// The commit took effect. A context that ended meanwhile must not turn
+		// it into an error the caller would retry.
+		return nil
+	}
+	return ended(t.ctx, err)
 }
 
 // ExecContext runs a statement, and answers the error of ctx alone when it failed after ctx ended.
