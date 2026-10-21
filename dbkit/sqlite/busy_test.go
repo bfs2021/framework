@@ -565,6 +565,34 @@ func TestClosingTheRowsOfAWriteEndsItsWaitWithItsContext(t *testing.T) {
 	}
 }
 
+func TestACommitEndsItsWaitWithTheContextOfBeginTx(t *testing.T) {
+	t.Parallel()
+
+	pinned := busyAttachHeld(t, rulesOpen(t, busyOptions(busyPoll)), "BEGIN", busyAuxRead)
+	ctx, cancel := context.WithTimeout(t.Context(), busyDeadline)
+	defer cancel()
+
+	tx, err := pinned.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v, want nil", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO aux.aux_rows VALUES (1)"); err != nil {
+		t.Fatalf("ExecContext() error = %v, want nil", err)
+	}
+	began := time.Now()
+
+	err = tx.Commit()
+
+	waited := time.Since(began)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Commit() error = %v, want one matching context.DeadlineExceeded", err)
+	}
+	if waited > busyBound {
+		t.Errorf("Commit() answered after %v, want within a tenth of the busy timeout %v", waited, optionsBusyTimeout)
+	}
+}
+
 // busyColumn is what database/sql reports of one column.
 type busyColumn struct {
 	// name is the column's name.
